@@ -272,6 +272,48 @@ impl KalshiApiClient {
         Ok(resp.events)
     }
     
+    /// Get all open events (no series filter), with pagination
+    /// Returns events matching the optional title filter
+    pub async fn get_all_events(&self, limit: u32) -> Result<Vec<KalshiEvent>> {
+        let mut all_events = Vec::new();
+        let mut cursor: Option<String> = None;
+        
+        loop {
+            let path = match &cursor {
+                Some(c) => format!("/events?status=open&limit={}&cursor={}", limit, c),
+                None => format!("/events?status=open&limit={}", limit),
+            };
+            
+            let resp: KalshiEventsResponse = self.get(&path).await?;
+            let fetched_count = resp.events.len();
+            all_events.extend(resp.events);
+            
+            // Check if there are more pages
+            match resp.cursor {
+                Some(c) if !c.is_empty() && fetched_count == limit as usize => {
+                    cursor = Some(c);
+                }
+                _ => break,
+            }
+        }
+        
+        Ok(all_events)
+    }
+    
+    /// Get mention/"say" events from Kalshi
+    /// Filters events that contain "say" in the title (case-insensitive)
+    pub async fn get_mention_events(&self) -> Result<Vec<KalshiEvent>> {
+        let all_events = self.get_all_events(100).await?;
+        
+        // Filter for events with "say" in the title
+        let mention_events: Vec<KalshiEvent> = all_events
+            .into_iter()
+            .filter(|e| e.title.to_lowercase().contains("say"))
+            .collect();
+        
+        Ok(mention_events)
+    }
+    
     pub async fn get_markets(&self, event_ticker: &str) -> Result<Vec<KalshiMarket>> {
         let path = format!("/markets?event_ticker={}", event_ticker);
         let resp: KalshiMarketsResponse = self.get(&path).await?;

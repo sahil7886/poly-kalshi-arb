@@ -15,7 +15,7 @@ use crate::config::{POLYMARKET_WS_URL, POLY_PING_INTERVAL_SECS, GAMMA_API_BASE};
 use crate::execution::NanoClock;
 use crate::types::{
     GlobalState, FastExecutionRequest, ArbType, PriceCents, SizeCents,
-    parse_price, fxhash_str,
+    parse_price, fxhash_str, PolySearchResponse, PolySearchMarket,
 };
 
 // === WebSocket Message Types ===
@@ -123,6 +123,59 @@ impl GammaClient {
         } else {
             Ok(None)
         }
+    }
+    
+    /// Search Polymarket markets by keyword query
+    /// Used to find mention markets (e.g., "What will X say?")
+    pub async fn search_markets(&self, query: &str) -> Result<Vec<PolySearchMarket>> {
+        let url = format!("{}/public-search?q={}&optimized=true", GAMMA_API_BASE, 
+            urlencoding::encode(query));
+        
+        let resp = self.http.get(&url).send().await?;
+        
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Polymarket search failed {}: {}", status, body);
+        }
+        
+        let search_result: PolySearchResponse = resp.json().await?;
+        
+        // Collect markets from events
+        let mut all_markets = Vec::new();
+        for event in search_result.events {
+            // Skip closed/inactive events
+            if event.closed == Some(true) || event.active == Some(false) {
+                continue;
+            }
+            all_markets.extend(event.markets);
+        }
+        
+        // Filter for active, non-closed markets
+        let active_markets: Vec<PolySearchMarket> = all_markets
+            .into_iter()
+            .filter(|m| m.closed != Some(true) && m.active != Some(false))
+            .collect();
+        
+        Ok(active_markets)
+    }
+    
+    /// Search Polymarket for mention/"say" markets
+    pub async fn search_mention_markets(&self) -> Result<Vec<PolySearchMarket>> {
+        // Search for "say" which is common keyword in mention markets
+        let markets = self.search_markets("say").await?;
+        
+        // Filter to only include markets that actually contain "say" in the question
+        let mention_markets: Vec<PolySearchMarket> = markets
+            .into_iter()
+            .filter(|m| {
+                m.question.as_ref()
+                    .map(|q| q.to_lowercase().contains("say"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        
+        Ok(mention_markets)
     }
 }
 

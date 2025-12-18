@@ -15,6 +15,7 @@ pub enum MarketType {
     Spread,
     Total,
     Btts,
+    Mention,  // "Say" markets - what will X say at event Y
 }
 
 impl std::fmt::Display for MarketType {
@@ -24,6 +25,7 @@ impl std::fmt::Display for MarketType {
             MarketType::Spread => write!(f, "spread"),
             MarketType::Total => write!(f, "total"),
             MarketType::Btts => write!(f, "btts"),
+            MarketType::Mention => write!(f, "mention"),
         }
     }
 }
@@ -1231,6 +1233,50 @@ pub struct GammaMarket {
     pub closed: Option<bool>,
 }
 
+/// Polymarket public search response wrapper
+#[derive(Debug, Deserialize)]
+pub struct PolySearchResponse {
+    #[serde(default)]
+    pub events: Vec<PolySearchEvent>,
+}
+
+/// Individual market from Polymarket search results
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct PolySearchMarket {
+    pub question: Option<String>,
+    pub slug: Option<String>,
+    #[serde(rename = "conditionId")]
+    pub condition_id: Option<String>,
+    #[serde(rename = "clobTokenIds")]
+    pub clob_token_ids: Option<String>,
+    /// Outcomes as array (e.g., ["Yes", "No"])
+    #[serde(default)]
+    pub outcomes: Vec<String>,
+    /// Outcome prices as array (e.g., ["0.575", "0.425"])
+    #[serde(default, rename = "outcomePrices")]
+    pub outcome_prices: Vec<String>,
+    pub active: Option<bool>,
+    pub closed: Option<bool>,
+    #[serde(rename = "groupItemTitle")]
+    pub group_item_title: Option<String>,
+}
+
+/// Event grouping from Polymarket search (contains multiple markets)
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct PolySearchEvent {
+    pub id: Option<String>,
+    pub slug: Option<String>,
+    pub title: Option<String>,
+    #[serde(rename = "endDate")]
+    pub end_date: Option<String>,
+    pub active: Option<bool>,
+    pub closed: Option<bool>,
+    #[serde(default)]
+    pub markets: Vec<PolySearchMarket>,
+}
+
 // === Discovery Result ===
 
 #[derive(Debug, Default)]
@@ -1242,3 +1288,10 @@ pub struct DiscoveryResult {
     pub poly_misses: usize,
     pub errors: Vec<String>,
 }
+
+hey
+
+whats going on??
+
+shit this is working!!!!
+

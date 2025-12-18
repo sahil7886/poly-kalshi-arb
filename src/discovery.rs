@@ -145,12 +145,33 @@ impl DiscoveryClient {
                 // Cache is fresh - use it directly
                 info!("📂 Loaded {} pairs from cache (age: {}s)",
                       cache.pairs.len(), cache.age_secs());
+                // Still run mention discovery so mention markets show up even when sports cache is fresh.
+                // Merge mention pairs into cached pairs and refresh cache if new ones are found.
+                let mention_result = self.discover_mention_markets().await;
+                let mut all_pairs = cache.pairs;
+                let mut new_mentions = 0usize;
+
+                for pair in mention_result.pairs {
+                    if !all_pairs.iter().any(|p| *p.kalshi_market_ticker == *pair.kalshi_market_ticker) {
+                        all_pairs.push(pair);
+                        new_mentions += 1;
+                    }
+                }
+
+                if new_mentions > 0 {
+                    info!("🆕 Added {} mention market pairs on top of fresh cache", new_mentions);
+                    let new_cache = DiscoveryCache::new(all_pairs.clone());
+                    if let Err(e) = Self::save_cache(&new_cache).await {
+                        warn!("Failed to update discovery cache with mention pairs: {}", e);
+                    }
+                }
+
                 return DiscoveryResult {
-                    pairs: cache.pairs,
-                    kalshi_events_found: 0,  // From cache
-                    poly_matches: 0,
+                    pairs: all_pairs,
+                    kalshi_events_found: new_mentions,
+                    poly_matches: new_mentions,
                     poly_misses: 0,
-                    errors: vec![],
+                    errors: mention_result.errors,
                 };
             }
             Some(cache) => {
@@ -222,6 +243,13 @@ impl DiscoveryClient {
             result.poly_matches += league_result.poly_matches;
             result.errors.extend(league_result.errors);
         }
+        
+        // Also discover mention markets (runs after sports to avoid rate limit conflicts)
+        let mention_result = self.discover_mention_markets().await;
+        result.pairs.extend(mention_result.pairs);
+        result.poly_matches += mention_result.poly_matches;
+        result.errors.extend(mention_result.errors);
+        
         result.kalshi_events_found = result.pairs.len();
 
         result
@@ -254,6 +282,15 @@ impl DiscoveryClient {
                     all_pairs.push(pair);
                     new_count += 1;
                 }
+            }
+        }
+        
+        // Also discover mention markets (incrementally)
+        let mention_result = self.discover_mention_markets().await;
+        for pair in mention_result.pairs {
+            if !all_pairs.iter().any(|p| *p.kalshi_market_ticker == *pair.kalshi_market_ticker) {
+                all_pairs.push(pair);
+                new_count += 1;
             }
         }
 
@@ -327,6 +364,7 @@ impl DiscoveryClient {
             MarketType::Spread => config.kalshi_series_spread,
             MarketType::Total => config.kalshi_series_total,
             MarketType::Btts => config.kalshi_series_btts,
+            MarketType::Mention => None,  // Mention markets are discovered separately
         }
     }
     
@@ -517,7 +555,195 @@ impl DiscoveryClient {
             MarketType::Btts => {
                 format!("{}-btts", base)
             }
+            MarketType::Mention => {
+                // Mention markets don't use this method
+                base
+            }
         }
+    }
+    
+    /// Discover mention/"say" markets across Polymarket and Kalshi
+    /// These are markets about what someone will say at an event
+    pub async fn discover_mention_markets(&self) -> DiscoveryResult {
+        info!("🎤 Discovering mention markets...");
+        
+        let mut result = DiscoveryResult::default();
+        
+        // Step 1: Search Polymarket for "say" markets
+        info!("  🔍 Searching Polymarket for mention markets...");
+        let poly_markets = match self.gamma.search_mention_markets().await {
+            Ok(markets) => {
+                info!("  ✅ Found {} Polymarket mention markets", markets.len());
+                markets
+            }
+            Err(e) => {
+                result.errors.push(format!("Polymarket search failed: {}", e));
+                warn!("  ❌ Polymarket search failed: {}", e);
+                return result;
+            }
+        };
+        
+        if poly_markets.is_empty() {
+            info!("  ℹ️ No Polymarket mention markets found");
+            return result;
+        }
+        
+        // Step 2: Parse Polymarket markets to extract metadata.
+        // IMPORTANT: public-search does NOT include clobTokenIds, so we must follow up by slug
+        // using GammaClient.lookup_market() to get (yes_token, no_token).
+        let poly_candidates: Vec<(String, String, String, MentionMarketMeta)> = poly_markets
+            .iter()
+            .filter_map(|m| {
+                let slug = m.slug.as_ref()?.to_string();
+                let question = m.question.as_ref()?.to_string();
+                let term = m.group_item_title.as_ref()?.to_string();
+                let meta = extract_mention_metadata(&question, Some(&term))?;
+                Some((slug, question, term, meta))
+            })
+            .collect();
+
+        let parsed_poly: Vec<PolyMentionMarket> = stream::iter(poly_candidates.into_iter())
+            .map(|(slug, question, term, meta)| {
+                let gamma = self.gamma.clone();
+                let semaphore = self.gamma_semaphore.clone();
+                async move {
+                    let _permit = semaphore.acquire().await.ok()?;
+                    match gamma.lookup_market(&slug).await {
+                        Ok(Some((yes_token, no_token))) => Some(PolyMentionMarket {
+                            slug,
+                            question,
+                            yes_token,
+                            no_token,
+                            term,
+                            meta,
+                        }),
+                        Ok(None) => None,
+                        Err(e) => {
+                            warn!("  ⚠️ Gamma lookup failed for {}: {}", slug, e);
+                            None
+                        }
+                    }
+                }
+            })
+            .buffer_unordered(GAMMA_CONCURRENCY)
+            .filter_map(|x| async { x })
+            .collect()
+            .await;
+
+        info!("  ✅ Parsed {} Polymarket mention markets with metadata", parsed_poly.len());
+        
+        // Step 3: Fetch Kalshi mention events
+        info!("  🔍 Fetching Kalshi mention events...");
+        let kalshi_events = {
+            let _permit = self.kalshi_semaphore.acquire().await.ok();
+            self.kalshi_limiter.until_ready().await;
+            match self.kalshi.get_mention_events().await {
+                Ok(events) => {
+                    info!("  ✅ Found {} Kalshi mention events", events.len());
+                    events
+                }
+                Err(e) => {
+                    result.errors.push(format!("Kalshi events fetch failed: {}", e));
+                    warn!("  ❌ Kalshi events fetch failed: {}", e);
+                    return result;
+                }
+            }
+        };
+        
+        if kalshi_events.is_empty() {
+            info!("  ℹ️ No Kalshi mention events found");
+            return result;
+        }
+        
+        result.kalshi_events_found = kalshi_events.len();
+        
+        // Step 4: Fetch markets for each Kalshi event and build metadata
+        let mut kalshi_mention_markets: Vec<(KalshiEvent, Vec<KalshiMarket>, MentionMarketMeta)> = Vec::new();
+        
+        for event in &kalshi_events {
+            // Rate-limited fetch of markets
+            {
+                let _permit = self.kalshi_semaphore.acquire().await.ok();
+                self.kalshi_limiter.until_ready().await;
+            }
+            
+            let markets = match self.kalshi.get_markets(&event.event_ticker).await {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!("  ⚠️ Failed to get markets for {}: {}", event.event_ticker, e);
+                    continue;
+                }
+            };
+            
+            // Parse event metadata
+            if let Some(meta) = extract_mention_metadata(&event.title, None) {
+                // Also try to extract date from event ticker
+                let meta = MentionMarketMeta {
+                    event_date: meta.event_date.or_else(|| extract_kalshi_mention_date(&event.event_ticker)),
+                    ..meta
+                };
+                kalshi_mention_markets.push((event.clone(), markets, meta));
+            }
+        }
+        
+        info!("  ✅ Parsed {} Kalshi mention events with metadata", kalshi_mention_markets.len());
+        
+        // Step 5: Match Polymarket to Kalshi markets
+        for poly in &parsed_poly {
+            for (kalshi_event, kalshi_markets, kalshi_meta) in &kalshi_mention_markets {
+                // Check if events match (same speaker + date)
+                let match_score = match_mention_markets(&poly.meta, kalshi_event, kalshi_meta);
+                
+                if match_score < 0.5 {
+                    continue; // Not a good enough match
+                }
+                
+                info!("  🎯 Potential match: {} <-> {} (score: {:.2})", 
+                      poly.question, kalshi_event.title, match_score);
+                
+                // Step 6: Find Kalshi market matching the single PM term
+                let common_terms = find_common_terms(&[poly.term.clone()], kalshi_markets);
+
+                for (term, _poly_idx, kalshi_ticker) in common_terms {
+                    
+                    // Create MarketPair for this term
+                    let pair_id = format!("mention-{}-{}-{}", 
+                        normalize_speaker(&poly.meta.who),
+                        poly.meta.event_date.as_deref().unwrap_or("unknown"),
+                        term.to_lowercase()
+                    );
+                    
+                    let description = format!("{} - {} - {}", 
+                        poly.meta.who,
+                        poly.meta.event_name,
+                        term
+                    );
+                    
+                    let pair = MarketPair {
+                        pair_id: pair_id.into(),
+                        league: "mention".into(),
+                        market_type: MarketType::Mention,
+                        description: description.into(),
+                        kalshi_event_ticker: kalshi_event.event_ticker.clone().into(),
+                        kalshi_market_ticker: kalshi_ticker.into(),
+                        poly_slug: poly.slug.clone().into(),
+                        poly_yes_token: poly.yes_token.clone().into(),
+                        poly_no_token: poly.no_token.clone().into(),
+                        line_value: None,
+                        team_suffix: Some(term.clone().into()),  // Store the term as team_suffix
+                    };
+                    
+                    info!("  ✅ Matched mention market: {} @ {} <-> {}", 
+                          term, pair.poly_slug, pair.kalshi_market_ticker);
+                    
+                    result.pairs.push(pair);
+                    result.poly_matches += 1;
+                }
+            }
+        }
+        
+        info!("🎤 Mention market discovery complete: {} pairs found", result.pairs.len());
+        result
     }
 }
 
@@ -651,6 +877,407 @@ fn extract_team_suffix(ticker: &str) -> Option<String> {
     splits.next().map(|s| s.to_uppercase())
 }
 
+// === Mention Market Helpers ===
+
+/// Metadata extracted from a mention/"say" market title
+#[derive(Debug, Clone)]
+pub struct MentionMarketMeta {
+    /// The speaker (e.g., "Trump", "Biden")
+    pub who: String,
+    /// The event name (e.g., "Address to the Nation", "State of the Union")
+    pub event_name: String,
+    /// The event date in various formats
+    pub event_date: Option<String>,
+    /// Individual terms/outcomes being bet on (e.g., ["Nuclear", "Tariff", "China"])
+    #[allow(dead_code)]
+    pub terms: Vec<String>,
+}
+
+/// Extract mention market metadata from a market title
+/// Parses titles like "What will Trump say during the address on December 17?"
+/// For Polymarket search results, term is the specific word being bet on
+pub fn extract_mention_metadata(title: &str, term: Option<&str>) -> Option<MentionMarketMeta> {
+    let title_lower = title.to_lowercase();
+    
+    // Must contain "say" to be a mention market
+    if !title_lower.contains("say") {
+        return None;
+    }
+    
+    // Extract the speaker (who)
+    let who = extract_speaker(&title_lower)?;
+    
+    // Extract the event name
+    let event_name = extract_event_name(&title_lower);
+    
+    // Extract the date
+    let event_date = extract_mention_date(title);
+    
+    // The term is the specific word being bet on (e.g., "Nuclear")
+    let terms = term.map(|t| vec![t.to_string()]).unwrap_or_default();
+    
+    Some(MentionMarketMeta {
+        who,
+        event_name,
+        event_date,
+        terms,
+    })
+}
+
+/// Extract speaker name from market title
+/// Looks for patterns like "will X say" or "X say"
+fn extract_speaker(title: &str) -> Option<String> {
+    // Common patterns:
+    // "Will Trump say..."
+    // "What will Trump say..."
+    // "Will President Trump say..."
+    
+    // Known speakers to look for (case-insensitive matching)
+    let known_speakers = [
+        "trump", "biden", "harris", "obama", "putin", "zelensky",
+        "xi", "musk", "powell", "yellen", "lagarde", "macron",
+        "modi", "netanyahu", "scholz", "sunak", "starmer",
+        "vance", "pelosi", "schumer", "mccarthy", "johnson",
+    ];
+    
+    let title_lower = title.to_lowercase();
+    
+    // First try to find known speakers
+    for speaker in &known_speakers {
+        if title_lower.contains(speaker) {
+            // Capitalize first letter
+            let mut chars = speaker.chars();
+            let capitalized = match chars.next() {
+                None => String::new(),
+                Some(c) => c.to_uppercase().chain(chars).collect(),
+            };
+            return Some(capitalized);
+        }
+    }
+    
+    // Try pattern matching for "will X say" - extract word between "will" and "say"
+    if let Some(will_idx) = title_lower.find("will ") {
+        let after_will = &title_lower[will_idx + 5..];
+        if let Some(say_idx) = after_will.find(" say") {
+            let between = after_will[..say_idx].trim();
+            // Could be "Trump" or "President Trump" - take last word
+            let speaker_word = between.split_whitespace().last()?;
+            // Skip common words
+            if !["the", "a", "he", "she", "they", "it"].contains(&speaker_word) {
+                let mut chars = speaker_word.chars();
+                let capitalized = match chars.next() {
+                    None => String::new(),
+                    Some(c) => c.to_uppercase().chain(chars).collect(),
+                };
+                return Some(capitalized);
+            }
+        }
+    }
+    
+    None
+}
+
+/// Extract event name from market title
+fn extract_event_name(title: &str) -> String {
+    // Common event patterns to look for
+    let event_patterns = [
+        ("address to the nation", "Address to the Nation"),
+        ("addressing the nation", "Address to the Nation"),
+        ("state of the union", "State of the Union"),
+        ("press conference", "Press Conference"),
+        ("speech", "Speech"),
+        ("debate", "Debate"),
+        ("interview", "Interview"),
+        ("rally", "Rally"),
+        ("briefing", "Briefing"),
+        ("announcement", "Announcement"),
+        ("inauguration", "Inauguration"),
+        ("address", "Address"),
+    ];
+    
+    let title_lower = title.to_lowercase();
+    
+    for (pattern, name) in &event_patterns {
+        if title_lower.contains(pattern) {
+            return name.to_string();
+        }
+    }
+    
+    // Default to generic "Speech/Address"
+    "Speech".to_string()
+}
+
+/// Extract date from mention market title
+/// Handles formats like "December 17", "Dec 17", "12/17", "2025-12-17"
+fn extract_mention_date(title: &str) -> Option<String> {
+    let title_lower = title.to_lowercase();
+    
+    // Month names and their numbers
+    let months = [
+        ("january", "01"), ("february", "02"), ("march", "03"), ("april", "04"),
+        ("may", "05"), ("june", "06"), ("july", "07"), ("august", "08"),
+        ("september", "09"), ("october", "10"), ("november", "11"), ("december", "12"),
+        ("jan", "01"), ("feb", "02"), ("mar", "03"), ("apr", "04"),
+        ("jun", "06"), ("jul", "07"), ("aug", "08"),
+        ("sep", "09"), ("oct", "10"), ("nov", "11"), ("dec", "12"),
+    ];
+    
+    // Try to find month name followed by day
+    for (month_name, month_num) in &months {
+        if let Some(idx) = title_lower.find(month_name) {
+            // Look for a day number after the month
+            // Slice the SAME string we searched in so indexes are valid even with Unicode.
+            let after_month = &title_lower[idx + month_name.len()..];
+            let after_month_trimmed = after_month.trim_start();
+            
+            // Extract day number
+            let day_str: String = after_month_trimmed
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            
+            if !day_str.is_empty() {
+                if let Ok(day) = day_str.parse::<u32>() {
+                    if day >= 1 && day <= 31 {
+                        // Assume current year or next year
+                        let year = 2025; // TODO: derive from context
+                        return Some(format!("{}-{}-{:02}", year, month_num, day));
+                    }
+                }
+            }
+        }
+    }
+    
+    // Try ISO format (YYYY-MM-DD) manually without panicking on Unicode.
+    // Look for pattern like "2025-12-17"
+    let bytes = title.as_bytes();
+    if bytes.len() >= 10 {
+        for i in 0..=(bytes.len() - 10) {
+            let b = &bytes[i..i + 10];
+            let is_digit = |c: u8| c.is_ascii_digit();
+            if is_digit(b[0]) && is_digit(b[1]) && is_digit(b[2]) && is_digit(b[3])
+                && b[4] == b'-'
+                && is_digit(b[5]) && is_digit(b[6])
+                && b[7] == b'-'
+                && is_digit(b[8]) && is_digit(b[9])
+            {
+                if title.is_char_boundary(i) && title.is_char_boundary(i + 10) {
+                    return Some(title[i..i + 10].to_string());
+                }
+            }
+        }
+    }
+    
+    None
+}
+
+
+/// Extract date from Kalshi event ticker for mention markets
+/// Format: "KXSAY-25DEC17" or similar
+pub fn extract_kalshi_mention_date(event_ticker: &str) -> Option<String> {
+    let parts: Vec<&str> = event_ticker.split('-').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    
+    // The date part should be like "25DEC17" (YYMMMDD)
+    let date_part = parts[1];
+    if date_part.len() >= 7 {
+        // Try to parse as YYMMMDD format
+        let year = format!("20{}", &date_part[..2]);
+        let month_str = &date_part[2..5].to_uppercase();
+        let month = match month_str.as_str() {
+            "JAN" => "01", "FEB" => "02", "MAR" => "03", "APR" => "04",
+            "MAY" => "05", "JUN" => "06", "JUL" => "07", "AUG" => "08",
+            "SEP" => "09", "OCT" => "10", "NOV" => "11", "DEC" => "12",
+            _ => return None,
+        };
+        let day = &date_part[5..7];
+        return Some(format!("{}-{}-{}", year, month, day));
+    }
+    
+    None
+}
+
+/// Normalize speaker name for matching
+pub fn normalize_speaker(name: &str) -> String {
+    name.to_lowercase()
+        .trim()
+        .replace("president ", "")
+        .replace("former ", "")
+        .replace("vice ", "")
+        .to_string()
+}
+
+/// Normalize date string for comparison
+pub fn normalize_date(date: &str) -> String {
+    // Remove any non-alphanumeric characters and lowercase
+    date.chars()
+        .filter(|c| c.is_alphanumeric() || *c == '-')
+        .collect::<String>()
+        .to_lowercase()
+}
+
+// === Mention Market Matching ===
+
+/// Parsed Polymarket mention market for matching
+#[derive(Debug, Clone)]
+pub struct PolyMentionMarket {
+    pub slug: String,
+    pub question: String,
+    pub yes_token: String,
+    pub no_token: String,
+    pub term: String,
+    pub meta: MentionMarketMeta,
+}
+
+/// Check if two mention markets are about the same event
+/// Returns match score (0.0 = no match, 1.0 = perfect match)
+pub fn match_mention_markets(
+    poly: &MentionMarketMeta,
+    kalshi_event: &KalshiEvent,
+    kalshi_meta: &MentionMarketMeta,
+) -> f32 {
+    let mut score: f32 = 0.0;
+    
+    // Speaker must match (required)
+    let poly_speaker = normalize_speaker(&poly.who);
+    let kalshi_speaker = normalize_speaker(&kalshi_meta.who);
+    
+    if poly_speaker != kalshi_speaker {
+        return 0.0; // No match if speakers differ
+    }
+    score += 0.4; // Speaker match is important
+    
+    // Date matching (highly important)
+    match (&poly.event_date, &kalshi_meta.event_date) {
+        (Some(poly_date), Some(kalshi_date)) => {
+            if normalize_date(poly_date) == normalize_date(kalshi_date) {
+                score += 0.4; // Exact date match
+            } else {
+                // Check if dates are within 1 day (timezone issues)
+                if dates_within_days(poly_date, kalshi_date, 1) {
+                    score += 0.3; // Close date match
+                } else {
+                    return 0.0; // Dates too different
+                }
+            }
+        }
+        _ => {
+            // If one or both dates missing, try to match by event name
+            score += 0.1;
+        }
+    }
+    
+    // Event name similarity (bonus)
+    let poly_event = poly.event_name.to_lowercase();
+    let kalshi_event_title = kalshi_event.title.to_lowercase();
+    
+    if kalshi_event_title.contains(&poly_event) || poly_event.contains(&kalshi_event.title.to_lowercase()) {
+        score += 0.2;
+    } else {
+        // Check for common event keywords
+        let event_keywords = ["address", "speech", "conference", "debate", "rally", "interview"];
+        for keyword in &event_keywords {
+            if poly_event.contains(keyword) && kalshi_event_title.contains(keyword) {
+                score += 0.1;
+                break;
+            }
+        }
+    }
+    
+    score.min(1.0)
+}
+
+/// Find common terms between Polymarket and Kalshi markets
+/// Returns list of (term, poly_index) pairs
+pub fn find_common_terms(
+    poly_outcomes: &[String],
+    kalshi_markets: &[KalshiMarket],
+) -> Vec<(String, usize, String)> {
+    let mut matches = Vec::new();
+    
+    for (poly_idx, poly_outcome) in poly_outcomes.iter().enumerate() {
+        let poly_term = poly_outcome.to_lowercase().trim().to_string();
+        
+        for kalshi_market in kalshi_markets {
+            let kalshi_term = kalshi_market.title.to_lowercase().trim().to_string();
+            
+            // Exact match (case-insensitive)
+            if poly_term == kalshi_term {
+                matches.push((poly_outcome.clone(), poly_idx, kalshi_market.ticker.clone()));
+                continue;
+            }
+            
+            // Check if one contains the other (for partial matches like "Nuclear" vs "Nuclear Weapons")
+            if poly_term.contains(&kalshi_term) || kalshi_term.contains(&poly_term) {
+                // Only match if one is a substring and the difference is small
+                let len_diff = (poly_term.len() as i32 - kalshi_term.len() as i32).abs();
+                if len_diff <= 5 {
+                    matches.push((poly_outcome.clone(), poly_idx, kalshi_market.ticker.clone()));
+                }
+            }
+        }
+    }
+    
+    matches
+}
+
+/// Check if two dates are within N days of each other
+fn dates_within_days(date1: &str, date2: &str, max_days: i32) -> bool {
+    // Parse ISO dates (YYYY-MM-DD)
+    let parse_date = |s: &str| -> Option<(i32, u32, u32)> {
+        let parts: Vec<&str> = s.split('-').collect();
+        if parts.len() != 3 {
+            return None;
+        }
+        let year: i32 = parts[0].parse().ok()?;
+        let month: u32 = parts[1].parse().ok()?;
+        let day: u32 = parts[2].parse().ok()?;
+        Some((year, month, day))
+    };
+    
+    let d1 = match parse_date(date1) {
+        Some(d) => d,
+        None => return false,
+    };
+    let d2 = match parse_date(date2) {
+        Some(d) => d,
+        None => return false,
+    };
+    
+    // Simple day-of-year comparison (ignoring year boundary edge cases for now)
+    let days1 = d1.0 * 365 + d1.1 as i32 * 31 + d1.2 as i32;
+    let days2 = d2.0 * 365 + d2.1 as i32 * 31 + d2.2 as i32;
+    
+    (days1 - days2).abs() <= max_days
+}
+
+/// Get Polymarket token IDs for a specific outcome index
+/// Returns (yes_token, no_token) for binary markets
+#[allow(dead_code)]
+pub fn get_poly_tokens_for_outcome(
+    clob_token_ids: &[String],
+    outcome_index: usize,
+) -> Option<(String, String)> {
+    // Polymarket token layout for multi-outcome markets:
+    // Each outcome has 2 tokens: YES and NO
+    // So outcome 0 = tokens[0] (YES), tokens[1] (NO)
+    // outcome 1 = tokens[2] (YES), tokens[3] (NO)
+    // etc.
+    let yes_idx = outcome_index * 2;
+    let no_idx = yes_idx + 1;
+    
+    if no_idx < clob_token_ids.len() {
+        Some((clob_token_ids[yes_idx].clone(), clob_token_ids[no_idx].clone()))
+    } else if clob_token_ids.len() >= 2 {
+        // Fallback: maybe it's a simple binary market
+        Some((clob_token_ids[0].clone(), clob_token_ids[1].clone()))
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -667,5 +1294,87 @@ mod tests {
     fn test_kalshi_date_to_iso() {
         assert_eq!(kalshi_date_to_iso("25DEC27"), "2025-12-27");
         assert_eq!(kalshi_date_to_iso("25JAN01"), "2025-01-01");
+    }
+    
+    // === Mention Market Tests ===
+    
+    #[test]
+    fn test_extract_speaker() {
+        assert_eq!(extract_speaker("what will trump say"), Some("Trump".to_string()));
+        assert_eq!(extract_speaker("Will Biden say something"), Some("Biden".to_string()));
+        assert_eq!(extract_speaker("what will president trump say"), Some("Trump".to_string()));
+        // Test actual PM question format
+        assert_eq!(
+            extract_speaker("will trump say \"nuclear\" while addressing the nation on december 17?"),
+            Some("Trump".to_string())
+        );
+        assert_eq!(
+            extract_speaker("will trump say \"isis\" or \"syria\" while addressing the nation on december 17?"),
+            Some("Trump".to_string())
+        );
+    }
+    
+    #[test]
+    fn test_extract_event_name() {
+        assert_eq!(extract_event_name("during the address to the nation"), "Address to the Nation");
+        assert_eq!(extract_event_name("at the press conference"), "Press Conference");
+        assert_eq!(extract_event_name("during his speech"), "Speech");
+    }
+    
+    #[test]
+    fn test_extract_mention_date() {
+        assert_eq!(extract_mention_date("on December 17"), Some("2025-12-17".to_string()));
+        assert_eq!(extract_mention_date("on Dec 5"), Some("2025-12-05".to_string()));
+        assert_eq!(extract_mention_date("on January 20"), Some("2025-01-20".to_string()));
+        assert_eq!(extract_mention_date("on 2025-12-17"), Some("2025-12-17".to_string()));
+    }
+    
+    #[test]
+    fn test_extract_mention_metadata() {
+        let meta = extract_mention_metadata(
+            "What will Trump say during the address on December 17?",
+            Some(r#"["Nuclear", "Tariff", "China"]"#)
+        ).unwrap();
+        
+        assert_eq!(meta.who, "Trump");
+        assert_eq!(meta.event_name, "Address");
+        assert_eq!(meta.event_date, Some("2025-12-17".to_string()));
+        assert_eq!(meta.terms, vec!["Nuclear", "Tariff", "China"]);
+    }
+    
+    #[test]
+    fn test_extract_kalshi_mention_date() {
+        assert_eq!(extract_kalshi_mention_date("KXSAY-25DEC17"), Some("2025-12-17".to_string()));
+        assert_eq!(extract_kalshi_mention_date("KXTRUMPSAY-25JAN20"), Some("2025-01-20".to_string()));
+    }
+    
+    #[test]
+    fn test_normalize_speaker() {
+        assert_eq!(normalize_speaker("President Trump"), "trump");
+        assert_eq!(normalize_speaker("BIDEN"), "biden");
+        assert_eq!(normalize_speaker("  Harris  "), "harris");
+    }
+    
+    #[test]
+    fn test_dates_within_days() {
+        assert!(dates_within_days("2025-12-17", "2025-12-17", 0));
+        assert!(dates_within_days("2025-12-17", "2025-12-18", 1));
+        assert!(!dates_within_days("2025-12-17", "2025-12-20", 1));
+    }
+    
+    #[test]
+    fn test_get_poly_tokens_for_outcome() {
+        let tokens = vec![
+            "token0-yes".to_string(), "token0-no".to_string(),
+            "token1-yes".to_string(), "token1-no".to_string(),
+        ];
+        
+        let (yes, no) = get_poly_tokens_for_outcome(&tokens, 0).unwrap();
+        assert_eq!(yes, "token0-yes");
+        assert_eq!(no, "token0-no");
+        
+        let (yes, no) = get_poly_tokens_for_outcome(&tokens, 1).unwrap();
+        assert_eq!(yes, "token1-yes");
+        assert_eq!(no, "token1-no");
     }
 }
