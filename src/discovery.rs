@@ -630,13 +630,10 @@ impl DiscoveryClient {
         for market in &kalshi_markets {
             // Parse Kalshi ticker to extract event timestamp
             // Ticker format: KXBTC15M-{ddMMMyyHHmm}-{seq} e.g., KXBTC15M-25DEC260015-15
-            let poly_slug = match Self::build_poly_slug_from_kalshi_btc15m(&market.ticker) {
-                Some(slug) => slug,
-                None => {
-                    warn!("  ⚠️ Could not parse Kalshi ticker: {}", market.ticker);
-                    continue;
-                }
-            };
+            // Use close_time explicitly to avoid timezone parsing issues
+            // Polymarket uses Start Time in slug, Kalshi close_time is End Time.
+            // Difference is 15 minutes (900 seconds).
+            let poly_slug = Self::build_poly_slug_from_timestamp(market.close_time);
             
             // Step 3: Lookup Polymarket event via Gamma API (using existing lookup_market method)
             let _permit = self.gamma_semaphore.acquire().await.ok();
@@ -682,51 +679,13 @@ impl DiscoveryClient {
     /// Build Polymarket slug from Kalshi BTC15M ticker
     /// Input: KXBTC15M-25DEC260015-15 (Dec 26, 2025 at 00:15 ET)
     /// Output: btc-updown-15m-{unix_timestamp}
-    fn build_poly_slug_from_kalshi_btc15m(ticker: &str) -> Option<String> {
-        // Parse format: KXBTC15M-{ddMMMyyHHmm}-{seq}
-        // Example: KXBTC15M-25DEC260015-15
-        let parts: Vec<&str> = ticker.split('-').collect();
-        if parts.len() < 2 || !parts[0].starts_with("KXBTC15M") {
-            return None;
-        }
-        
-        let date_part = parts[1]; // "25DEC260015" - ddMMMyyHHmm
-        if date_part.len() < 11 {
-            return None;
-        }
-        
-        // Parse date components
-        // Parse date components (Format: YYMMMddHHmm)
-        let year_short: u32 = date_part[0..2].parse().ok()?;
-        let month_str = &date_part[2..5]; // "DEC"
-        let day: u32 = date_part[5..7].parse().ok()?;
-        let hour: u32 = date_part[7..9].parse().ok()?;
-        let minute: u32 = date_part[9..11].parse().ok()?;
-        
-        let month = match month_str.to_uppercase().as_str() {
-            "JAN" => 1, "FEB" => 2, "MAR" => 3, "APR" => 4, "MAY" => 5, "JUN" => 6,
-            "JUL" => 7, "AUG" => 8, "SEP" => 9, "OCT" => 10, "NOV" => 11, "DEC" => 12,
-            _ => return None,
-        };
-        
-        let year = 2000 + year_short;
-        
-        // Convert to Unix timestamp (approximate - ET timezone)
-        // Use chrono for proper timezone handling
-        use chrono::{TimeZone, Utc, FixedOffset};
-        
-        // ET is UTC-5 (standard) or UTC-4 (daylight)
-        // For simplicity, use UTC-5 as a baseline
-        let et_offset = FixedOffset::west_opt(5 * 3600)?;
-        
-        let dt = et_offset
-            .with_ymd_and_hms(year as i32, month, day, hour, minute, 0)
-            .single()?;
-        
-        // Polymarket uses start time, Kalshi uses end time (15 min difference)
-        let unix_ts = dt.with_timezone(&Utc).timestamp() - 900;
-        
-        Some(format!("btc-updown-15m-{}", unix_ts))
+    /// Build Polymarket slug from Kalshi timestamp
+    /// Kalshi close_time is the event End Time.
+    /// Polymarket slug uses Start Time.
+    /// Duration is 15 minutes (900 seconds).
+    fn build_poly_slug_from_timestamp(close_time: chrono::DateTime<chrono::Utc>) -> String {
+        let unix_ts = close_time.timestamp() - 900;
+        format!("btc-updown-15m-{}", unix_ts)
     }
     
     /// Discover mention/"say" markets across Polymarket and Kalshi

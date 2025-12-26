@@ -545,7 +545,7 @@ impl LocalOrderBook {
         let (yes_ask, yes_size) = self.no_bids.iter().next_back() // Highest bid
             .map(|(price, qty)| {
                 let ask = (100 - price) as PriceCents;
-                let size = (qty * price / 100) as SizeCents;
+                let size = (qty * 100).min(SizeCents::MAX as i64) as SizeCents;
                 (ask, size)
             })
             .unwrap_or((0, 0));
@@ -554,7 +554,7 @@ impl LocalOrderBook {
         let (no_ask, no_size) = self.yes_bids.iter().next_back() // Highest bid
             .map(|(price, qty)| {
                 let ask = (100 - price) as PriceCents;
-                let size = (qty * price / 100) as SizeCents;
+                let size = (qty * 100).min(SizeCents::MAX as i64) as SizeCents;
                 (ask, size)
             })
             .unwrap_or((0, 0));

@@ -469,8 +469,8 @@ impl ExecutionEngine {
         arb_type: ArbType,
         yes_filled: i64,
         no_filled: i64,
-        yes_price: u16,
-        no_price: u16,
+        yes_price: crate::types::PriceCents,
+        no_price: crate::types::PriceCents,
         poly_yes_token: Arc<str>,
         poly_no_token: Arc<str>,
         kalshi_ticker: Arc<str>,
@@ -499,7 +499,7 @@ impl ExecutionEngine {
                 } else {
                     (&poly_no_token, "no", no_price)
                 };
-                let close_price = cents_to_price((price as i16).saturating_sub(10).max(1) as u16);
+                let close_price = cents_to_price(((price as i16).saturating_sub(10).max(1)) as u8);
 
                 info!("[EXEC] 🔄 Waiting 2s for Poly settlement before auto-close ({} {} contracts)", excess, side);
                 tokio::time::sleep(Duration::from_secs(2)).await;
@@ -530,7 +530,7 @@ impl ExecutionEngine {
             ArbType::PolyYesKalshiNo => {
                 if yes_filled > no_filled {
                     // Poly YES excess
-                    let close_price = cents_to_price((yes_price as i16).saturating_sub(10).max(1) as u16);
+                    let close_price = cents_to_price(((yes_price as i16).saturating_sub(10).max(1)) as u8);
                     info!("[EXEC] 🔄 Waiting 2s for Poly settlement before auto-close ({} yes contracts)", excess);
                     tokio::time::sleep(Duration::from_secs(2)).await;
 
@@ -564,7 +564,7 @@ impl ExecutionEngine {
                     }
                 } else {
                     // Poly NO excess
-                    let close_price = cents_to_price((no_price as i16).saturating_sub(10).max(1) as u16);
+                    let close_price = cents_to_price(((no_price as i16).saturating_sub(10).max(1)) as u8);
                     info!("[EXEC] 🔄 Waiting 2s for Poly settlement before auto-close ({} no contracts)", excess);
                     tokio::time::sleep(Duration::from_secs(2)).await;
 

@@ -89,7 +89,7 @@ async fn run_session(
 
     let pos_writer_handle = tokio::spawn(position_writer_loop(position_rx, position_tracker));
 
-    let threshold_cents: PriceCents = ((ARB_THRESHOLD * 100.0).round() as u16).max(1);
+    let threshold_cents: PriceCents = ((ARB_THRESHOLD * 100.0).round() as u8).max(1);
     
     let engine = Arc::new(ExecutionEngine::new(
         kalshi_api.clone(),
@@ -193,12 +193,12 @@ async fn run_session(
             let mut with_kalshi = 0;
             let mut with_poly = 0;
             let mut with_both = 0;
-            // (cost, market_id, p_yes, k_no, k_yes, p_no, fee, is_poly_yes_kalshi_no)
-            let mut best_arb: Option<(u16, u16, u16, u16, u16, u16, u16, bool)> = None;
+            // (cost, market_id, p_yes, k_no, k_yes, p_no, fee, is_poly_yes, size_yes, size_no)
+            let mut best_arb: Option<(u16, u16, u8, u8, u8, u8, u8, bool, u32, u32)> = None;
 
             for market in heartbeat_state.markets.iter().take(market_count) {
-                let (k_yes, k_no, _, _) = market.kalshi.load();
-                let (p_yes, p_no, _, _) = market.poly.load();
+                let (k_yes, k_no, k_yes_size, k_no_size) = market.kalshi.load();
+                let (p_yes, p_no, p_yes_size, p_no_size) = market.poly.load();
                 
                 // Track availability
                 if k_yes > 0 || k_no > 0 { with_kalshi += 1; }
@@ -221,19 +221,19 @@ async fn run_session(
 
                 if can_arb_1 {
                     let fee1 = kalshi_fee_cents(k_no);
-                    let cost1 = p_yes + k_no + fee1;
+                    let cost1 = p_yes as u16 + k_no as u16 + fee1 as u16;
                     if best_arb.is_none() || cost1 < best_arb.as_ref().unwrap().0 {
                          // Arb Type 1: Poly Yes, Kalshi No
-                         best_arb = Some((cost1, market.market_id, p_yes, k_no, k_yes, p_no, fee1, true));
+                         best_arb = Some((cost1, market.market_id, p_yes, k_no, k_yes, p_no, fee1, true, p_yes_size, k_no_size));
                     }
                 }
                 
                 if can_arb_2 {
                     let fee2 = kalshi_fee_cents(k_yes);
-                    let cost2 = k_yes + fee2 + p_no;
+                    let cost2 = k_yes as u16 + fee2 as u16 + p_no as u16;
                      if best_arb.is_none() || cost2 < best_arb.as_ref().unwrap().0 {
                          // Arb Type 2: Kalshi Yes, Poly No
-                         best_arb = Some((cost2, market.market_id, p_yes, k_no, k_yes, p_no, fee2, false));
+                         best_arb = Some((cost2, market.market_id, p_yes, k_no, k_yes, p_no, fee2, false, k_yes_size, p_no_size));
                     }
                 }
                 
@@ -247,27 +247,35 @@ async fn run_session(
             info!("💓 Heartbeat | Markets: {} total, {} w/Kalshi, {} w/Poly, {} w/Overlap | threshold={}¢",
                   market_count, with_kalshi, with_poly, with_both, heartbeat_threshold);
             
-            if let Some((cost, market_id, p_yes, k_no, k_yes, p_no, fee, is_poly_yes)) = best_arb {
+            if let Some((cost, market_id, p_yes, k_no, k_yes, p_no, fee, is_poly_yes, s_yes, s_no)) = best_arb {
                 let gap = cost as i16 - heartbeat_threshold as i16;
                 let desc = heartbeat_state.get_by_id(market_id)
                     .and_then(|m| m.pair())
                     .map(|p| p.description.to_string())
                     .unwrap_or_else(|| "Unknown".to_string());
-                let leg_breakdown = if is_poly_yes {
-                    format!("P_yes({}¢) + K_no({}¢) + K_fee({}¢) = {}¢", p_yes, k_no, fee, cost)
+                
+                let (vol_str, leg_breakdown) = if is_poly_yes {
+                    (
+                        format!("Vol: P_yes({}) / K_no({})", s_yes / 100, s_no / 100),
+                        format!("P_yes({}¢) + K_no({}¢) + K_fee({}¢) = {}¢", p_yes, k_no, fee, cost)
+                    )
                 } else {
-                    format!("K_yes({}¢) + P_no({}¢) + K_fee({}¢) = {}¢", k_yes, p_no, fee, cost)
+                    (
+                        format!("Vol: K_yes({}) / P_no({})", s_yes / 100, s_no / 100),
+                        format!("K_yes({}¢) + P_no({}¢) + K_fee({}¢) = {}¢", k_yes, p_no, fee, cost)
+                    )
                 };
-                if gap <= 10 {
-                    info!("   📊 Best: {} | {} | gap={:+}¢ | [P_yes={}¢ K_no={}¢ K_yes={}¢ P_no={}¢]", 
-                          desc, leg_breakdown, gap, p_yes, k_no, k_yes, p_no);
+
+                if gap <= 0 {
+                    info!(" Arb Found: {} | {} | gap={:+}¢ | {} | [P_yes={}¢ K_no={}¢ K_yes={}¢ P_no={}¢]", 
+                          desc, leg_breakdown, gap, vol_str, p_yes, k_no, k_yes, p_no);
                 } else {
-                    info!("   📊 Best: {} | {} | gap={:+}¢ - efficient", 
-                          desc, leg_breakdown, gap);
+                    info!(" Best: {} | {} | gap={:+}¢ | {} | [P_yes={}¢ K_no={}¢ K_yes={}¢ P_no={}¢]", 
+                          desc, leg_breakdown, gap, vol_str, p_yes, k_no, k_yes, p_no);
                 }
             } else if with_both == 0 {
                 if market_count > 0 {
-                    warn!("   ⚠️  No actionable overlap (missing crossing sides) - check liquidity");
+                    warn!(" ⚠️ No actionable overlap (missing crossing sides) - check liquidity");
                 }
             }
         }

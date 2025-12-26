@@ -49,10 +49,10 @@ pub struct MarketPair {
 }
 
 /// Price in cents (1-99 for 0.01-0.99), 0 = no price available
-pub type PriceCents = u16;
+pub type PriceCents = u8;
 
-/// Size in cents (dollar amount × 100), max ~$655k per side
-pub type SizeCents = u16;
+/// Size in units (Contracts * 100), max ~16 million
+pub type SizeCents = u32;
 
 /// Maximum number of tracked markets
 pub const MAX_MARKETS: usize = 1024;
@@ -60,19 +60,21 @@ pub const MAX_MARKETS: usize = 1024;
 /// Sentinel value for "no price available"
 pub const NO_PRICE: PriceCents = 0;
 
-/// Layout: [yes_ask:16][no_ask:16][yes_size:16][no_size:16]
+/// Layout: [yes_ask:8][no_ask:8][yes_size:24][no_size:24]
 #[inline(always)]
 pub fn pack_orderbook(yes_ask: PriceCents, no_ask: PriceCents, yes_size: SizeCents, no_size: SizeCents) -> u64 {
-    ((yes_ask as u64) << 48) | ((no_ask as u64) << 32) | ((yes_size as u64) << 16) | (no_size as u64)
+    let ys = yes_size.min(0xFFFFFF) as u64;
+    let ns = no_size.min(0xFFFFFF) as u64;
+    ((yes_ask as u64) << 56) | ((no_ask as u64) << 48) | (ys << 24) | ns
 }
 
 /// Unpack u64 back to 4 values
 #[inline(always)]
 pub fn unpack_orderbook(packed: u64) -> (PriceCents, PriceCents, SizeCents, SizeCents) {
-    let yes_ask = ((packed >> 48) & 0xFFFF) as PriceCents;
-    let no_ask = ((packed >> 32) & 0xFFFF) as PriceCents;
-    let yes_size = ((packed >> 16) & 0xFFFF) as SizeCents;
-    let no_size = (packed & 0xFFFF) as SizeCents;
+    let yes_ask = ((packed >> 56) & 0xFF) as PriceCents;
+    let no_ask = ((packed >> 48) & 0xFF) as PriceCents;
+    let yes_size = ((packed >> 24) & 0xFFFFFF) as SizeCents;
+    let no_size = (packed & 0xFFFFFF) as SizeCents;
     (yes_ask, no_ask, yes_size, no_size)
 }
 
@@ -181,10 +183,10 @@ impl AtomicMarketState {
         let k_no_fee = KALSHI_FEE_TABLE[k_no as usize];
 
         let costs = i16x8::new([
-            (p_yes + k_no + k_no_fee) as i16,
-            (k_yes + k_yes_fee + p_no) as i16,
-            (p_yes + p_no) as i16,
-            (k_yes + k_yes_fee + k_no + k_no_fee) as i16,
+            (p_yes as i16 + k_no as i16 + k_no_fee as i16),
+            (k_yes as i16 + k_yes_fee as i16 + p_no as i16),
+            (p_yes as i16 + p_no as i16),
+            (k_yes as i16 + k_yes_fee as i16 + k_no as i16 + k_no_fee as i16),
             i16::MAX, i16::MAX, i16::MAX, i16::MAX,
         ]);
 
@@ -221,10 +223,11 @@ pub fn kalshi_fee_cents(price_cents: PriceCents) -> PriceCents {
     if price_cents > 100 {
         return 0;
     }
-    KALSHI_FEE_TABLE[price_cents as usize]
+    KALSHI_FEE_TABLE[price_cents as usize] as PriceCents
 }
 
 /// Convert f64 price (0.01-0.99) to PriceCents (1-99)
+#[inline(always)]
 #[inline(always)]
 pub fn price_to_cents(price: f64) -> PriceCents {
     ((price * 100.0).round() as PriceCents).clamp(0, 99)
@@ -246,14 +249,14 @@ pub fn parse_price(s: &str) -> PriceCents {
         let d1 = bytes[2].wrapping_sub(b'0');
         let d2 = bytes[3].wrapping_sub(b'0');
         if d1 < 10 && d2 < 10 {
-            return (d1 as u16 * 10 + d2 as u16) as PriceCents;
+            return (d1 as u8 * 10 + d2 as u8) as PriceCents;
         }
     }
     // Handle "0.X" format (3 chars) for prices like 0.5
     if bytes.len() == 3 && bytes[0] == b'0' && bytes[1] == b'.' {
         let d = bytes[2].wrapping_sub(b'0');
         if d < 10 {
-            return (d as u16 * 10) as PriceCents;
+            return (d as u8 * 10) as PriceCents;
         }
     }
     // Fallback to standard parse
