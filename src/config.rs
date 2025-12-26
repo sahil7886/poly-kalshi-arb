@@ -29,6 +29,29 @@ pub const WS_RECONNECT_DELAY_SECS: u64 = 5;
 /// Which leagues to monitor (empty slice = all)
 pub const ENABLED_LEAGUES: &[&str] = &[];
 
+/// Enable sports market discovery
+pub const ENABLE_SPORTS: bool = false;
+
+/// Enable mention/say market discovery
+pub const ENABLE_MENTIONS: bool = false;
+
+/// Which sports market types to enable
+pub const ENABLED_MARKET_TYPES: &[crate::types::MarketType] = &[
+    crate::types::MarketType::Moneyline,
+    crate::types::MarketType::Spread,
+    crate::types::MarketType::Total,
+    crate::types::MarketType::Btts,
+];
+
+/// Enable BTC 15m Up/Down market discovery
+pub const ENABLE_BTC15M: bool = true;
+
+/// Kalshi series ticker for BTC 15m markets
+pub const KALSHI_BTC15M_SERIES: &str = "KXBTC15M";
+
+/// Polymarket series slug for BTC 15m markets
+pub const POLY_BTC15M_SERIES: &str = "btc-up-or-down-15m";
+
 /// Price logging enabled (set PRICE_LOGGING=1 to enable)
 #[allow(dead_code)]
 pub fn price_logging_enabled() -> bool {

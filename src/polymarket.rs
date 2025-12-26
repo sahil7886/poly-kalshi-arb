@@ -233,15 +233,16 @@ fn parse_size(s: &str) -> SizeCents {
         .unwrap_or(0)
 }
 
-/// WebSocket runner
+/// WebSocket runner with max duration for periodic refresh
 pub async fn run_ws(
     state: Arc<GlobalState>,
     exec_tx: mpsc::Sender<FastExecutionRequest>,
     threshold_cents: PriceCents,
+    max_duration_secs: u64,
 ) -> Result<()> {
     let tokens: Vec<String> = state.markets.iter()
         .take(state.market_count())
-        .filter_map(|m| m.pair.as_ref())
+        .filter_map(|m| m.pair())
         .flat_map(|p| [p.poly_yes_token.to_string(), p.poly_no_token.to_string()])
         .collect();
 
@@ -267,10 +268,15 @@ pub async fn run_ws(
 
     write.send(Message::Text(serde_json::to_string(&subscribe_msg)?)).await?;
     info!("[POLY] Subscribed to {} tokens", tokens.len());
+    // Debug: log first few token IDs we're subscribing to
+    for (i, token) in tokens.iter().take(4).enumerate() {
+        tracing::debug!("[POLY] Token {}: {}", i, token);
+    }
 
     let clock = NanoClock::new();
     let mut ping_interval = interval(Duration::from_secs(POLY_PING_INTERVAL_SECS));
     let mut last_message = Instant::now();
+    let start_time = Instant::now();
 
     loop {
         tokio::select! {
@@ -296,6 +302,10 @@ pub async fn run_ws(
                         else if let Ok(event) = serde_json::from_str::<PriceChangeEvent>(&text) {
                             if event.event_type.as_deref() == Some("price_change") {
                                 if let Some(changes) = &event.price_changes {
+                                    // Temp: Log to confirm price changes are being received
+                                    if !changes.is_empty() {
+                                        tracing::debug!("[POLY] Received {} price_change(s)", changes.len());
+                                    }
                                     for change in changes {
                                         process_price_change(&state, change, &exec_tx, threshold_cents, &clock).await;
                                     }
@@ -335,6 +345,12 @@ pub async fn run_ws(
             warn!("[POLY] Stale connection, reconnecting...");
             break;
         }
+        
+        // Periodic refresh: reconnect to pick up new markets
+        if start_time.elapsed() > Duration::from_secs(max_duration_secs) {
+            info!("[POLY] Max duration reached, reconnecting for fresh subscriptions...");
+            break;
+        }
     }
 
     Ok(())
@@ -361,8 +377,16 @@ async fn process_book(
         .min_by_key(|(p, _)| *p)
         .unwrap_or((0, 0));
 
-    // Check if YES token
-    if let Some(&market_id) = state.poly_yes_to_id.get(&token_hash) {
+    // Check YES token first
+    let yes_id = state.poly_yes_to_id.read().unwrap().get(&token_hash).copied();
+    // Check NO token (guard dropped before any await)
+    let no_id = if yes_id.is_none() {
+        state.poly_no_to_id.read().unwrap().get(&token_hash).copied()
+    } else {
+        None
+    };
+    
+    if let Some(market_id) = yes_id {
         let market = &state.markets[market_id as usize];
         market.poly.update_yes(best_ask, ask_size);
 
@@ -373,7 +397,7 @@ async fn process_book(
         }
     }
     // Check if NO token
-    else if let Some(&market_id) = state.poly_no_to_id.get(&token_hash) {
+    else if let Some(market_id) = no_id {
         let market = &state.markets[market_id as usize];
         market.poly.update_no(best_ask, ask_size);
 
@@ -394,8 +418,8 @@ async fn process_price_change(
     threshold_cents: PriceCents,
     clock: &NanoClock,
 ) {
-    // Only process ASK side updates
-    if !matches!(change.side.as_deref(), Some("ASK" | "ask")) {
+    // Only process ASK side updates (Polymarket sends "SELL" for asks)
+    if !matches!(change.side.as_deref(), Some("SELL" | "sell")) {
         return;
     }
 
@@ -405,35 +429,55 @@ async fn process_price_change(
 
     let token_hash = fxhash_str(&change.asset_id);
 
-    // Check YES token
-    if let Some(&market_id) = state.poly_yes_to_id.get(&token_hash) {
+    // Check YES token first (guard dropped immediately)
+    let yes_id = state.poly_yes_to_id.read().unwrap().get(&token_hash).copied();
+    // Check NO token (guard dropped before any await)
+    let no_id = if yes_id.is_none() {
+        state.poly_no_to_id.read().unwrap().get(&token_hash).copied()
+    } else {
+        None
+    };
+    
+    if let Some(market_id) = yes_id {
         let market = &state.markets[market_id as usize];
-        let (current_yes, _, current_yes_size, _) = market.poly.load();
+        let (old_yes, _, current_yes_size, _) = market.poly.load();
 
-        // Only update if new price is better (lower)
-        if price < current_yes || current_yes == 0 {
-            // Keep existing size - it may be stale but FAK orders handle partial fills.
-            // Size is an upper bound anyway; better to attempt arb than miss it.
-            market.poly.update_yes(price, current_yes_size);
+        // Always update on price_change - this IS the new best ask
+        market.poly.update_yes(price, current_yes_size);
+        
+        if price != old_yes {
+            //tracing::debug!("[POLY] YES price updated: {}¢ → {}¢ (market {})", old_yes, price, market_id);
+        }
 
-            let arb_mask = market.check_arbs(threshold_cents);
-            if arb_mask != 0 {
-                send_arb_request(market_id, market, arb_mask, exec_tx, clock).await;
-            }
+        let arb_mask = market.check_arbs(threshold_cents);
+        if arb_mask != 0 {
+            send_arb_request(market_id, market, arb_mask, exec_tx, clock).await;
         }
     }
     // Check NO token
-    else if let Some(&market_id) = state.poly_no_to_id.get(&token_hash) {
+    else if let Some(market_id) = no_id {
         let market = &state.markets[market_id as usize];
-        let (_, current_no, _, current_no_size) = market.poly.load();
+        let (_, old_no, _, current_no_size) = market.poly.load();
 
-        if price < current_no || current_no == 0 {
-            market.poly.update_no(price, current_no_size);
+        // Always update on price_change
+        market.poly.update_no(price, current_no_size);
+        
+        if price != old_no {
+            //tracing::debug!("[POLY] NO price updated: {}¢ → {}¢ (market {})", old_no, price, market_id);
+        }
 
-            let arb_mask = market.check_arbs(threshold_cents);
-            if arb_mask != 0 {
-                send_arb_request(market_id, market, arb_mask, exec_tx, clock).await;
-            }
+        let arb_mask = market.check_arbs(threshold_cents);
+        if arb_mask != 0 {
+            send_arb_request(market_id, market, arb_mask, exec_tx, clock).await;
+        }
+    }
+    // Token not in our tracked list - log first occurrence for debugging
+    else {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static LOGGED_UNMATCHED: AtomicBool = AtomicBool::new(false);
+        if !LOGGED_UNMATCHED.swap(true, Ordering::Relaxed) {
+             tracing::warn!("[POLY] First unmatched token: {} (price {}¢) - not in our tracked list", 
+                   change.asset_id, price);
         }
     }
 }

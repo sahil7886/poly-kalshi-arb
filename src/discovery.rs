@@ -1,10 +1,12 @@
 // src/discovery.rs
 // Market discovery - matches Kalshi events to Polymarket markets
 
-use anyhow::Result;
+
 use futures_util::{stream, StreamExt};
 use governor::{Quota, RateLimiter, state::NotKeyed, clock::DefaultClock, middleware::NoOpMiddleware};
 use serde::{Serialize, Deserialize};
+use anyhow::{Context, Result};
+use chrono::Utc;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -147,22 +149,26 @@ impl DiscoveryClient {
                       cache.pairs.len(), cache.age_secs());
                 // Still run mention discovery so mention markets show up even when sports cache is fresh.
                 // Merge mention pairs into cached pairs and refresh cache if new ones are found.
-                let mention_result = self.discover_mention_markets().await;
                 let mut all_pairs = cache.pairs;
                 let mut new_mentions = 0usize;
+                let mut errors = vec![];
 
-                for pair in mention_result.pairs {
-                    if !all_pairs.iter().any(|p| *p.kalshi_market_ticker == *pair.kalshi_market_ticker) {
-                        all_pairs.push(pair);
-                        new_mentions += 1;
+                if crate::config::ENABLE_MENTIONS {
+                    let mention_result = self.discover_mention_markets().await;
+                    errors.extend(mention_result.errors);
+                    for pair in mention_result.pairs {
+                        if !all_pairs.iter().any(|p| *p.kalshi_market_ticker == *pair.kalshi_market_ticker) {
+                            all_pairs.push(pair);
+                            new_mentions += 1;
+                        }
                     }
-                }
 
-                if new_mentions > 0 {
-                    info!("🆕 Added {} mention market pairs on top of fresh cache", new_mentions);
-                    let new_cache = DiscoveryCache::new(all_pairs.clone());
-                    if let Err(e) = Self::save_cache(&new_cache).await {
-                        warn!("Failed to update discovery cache with mention pairs: {}", e);
+                    if new_mentions > 0 {
+                        info!("🆕 Added {} mention market pairs on top of fresh cache", new_mentions);
+                        let new_cache = DiscoveryCache::new(all_pairs.clone());
+                        if let Err(e) = Self::save_cache(&new_cache).await {
+                            warn!("Failed to update discovery cache with mention pairs: {}", e);
+                        }
                     }
                 }
 
@@ -171,7 +177,7 @@ impl DiscoveryClient {
                     kalshi_events_found: new_mentions,
                     poly_matches: new_mentions,
                     poly_misses: 0,
-                    errors: mention_result.errors,
+                    errors,
                 };
             }
             Some(cache) => {
@@ -230,25 +236,36 @@ impl DiscoveryClient {
         };
 
         // Parallel discovery across all leagues
-        let league_futures: Vec<_> = configs.iter()
-            .map(|config| self.discover_league(config, None))
-            .collect();
-
-        let league_results = futures_util::future::join_all(league_futures).await;
-
-        // Merge results
         let mut result = DiscoveryResult::default();
-        for league_result in league_results {
-            result.pairs.extend(league_result.pairs);
-            result.poly_matches += league_result.poly_matches;
-            result.errors.extend(league_result.errors);
+        if crate::config::ENABLE_SPORTS {
+            let league_futures: Vec<_> = configs.iter()
+                .map(|config| self.discover_league(config, None))
+                .collect();
+
+            let league_results = futures_util::future::join_all(league_futures).await;
+
+            // Merge results
+            for league_result in league_results {
+                result.pairs.extend(league_result.pairs);
+                result.poly_matches += league_result.poly_matches;
+                result.errors.extend(league_result.errors);
+            }
         }
         
         // Also discover mention markets (runs after sports to avoid rate limit conflicts)
-        let mention_result = self.discover_mention_markets().await;
-        result.pairs.extend(mention_result.pairs);
-        result.poly_matches += mention_result.poly_matches;
-        result.errors.extend(mention_result.errors);
+        if crate::config::ENABLE_MENTIONS {
+            let mention_result = self.discover_mention_markets().await;
+            result.pairs.extend(mention_result.pairs);
+            result.poly_matches += mention_result.poly_matches;
+            result.errors.extend(mention_result.errors);
+        }
+
+        if crate::config::ENABLE_BTC15M {
+            let btc_result = self.discover_btc15m_markets().await;
+            result.pairs.extend(btc_result.pairs);
+            result.poly_matches += btc_result.poly_matches;
+            result.errors.extend(btc_result.errors);
+        }
         
         result.kalshi_events_found = result.pairs.len();
 
@@ -265,32 +282,35 @@ impl DiscoveryClient {
                 .collect()
         };
 
-        // Discover with filter for known tickers
-        let league_futures: Vec<_> = configs.iter()
-            .map(|config| self.discover_league(config, Some(&cache)))
-            .collect();
-
-        let league_results = futures_util::future::join_all(league_futures).await;
-
-        // Merge cached pairs with newly discovered ones
-        let mut all_pairs = cache.pairs;
+        let mut all_pairs = cache.pairs.clone();
         let mut new_count = 0;
 
-        for league_result in league_results {
-            for pair in league_result.pairs {
-                if !all_pairs.iter().any(|p| *p.kalshi_market_ticker == *pair.kalshi_market_ticker) {
-                    all_pairs.push(pair);
-                    new_count += 1;
+        if crate::config::ENABLE_SPORTS {
+            // Discover with filter for known tickers
+            let league_futures: Vec<_> = configs.iter()
+                .map(|config| self.discover_league(config, Some(&cache)))
+                .collect();
+
+            let league_results = futures_util::future::join_all(league_futures).await;
+
+            for league_result in league_results {
+                for pair in league_result.pairs {
+                    if !all_pairs.iter().any(|p| *p.kalshi_market_ticker == *pair.kalshi_market_ticker) {
+                        all_pairs.push(pair);
+                        new_count += 1;
+                    }
                 }
             }
         }
         
         // Also discover mention markets (incrementally)
-        let mention_result = self.discover_mention_markets().await;
-        for pair in mention_result.pairs {
-            if !all_pairs.iter().any(|p| *p.kalshi_market_ticker == *pair.kalshi_market_ticker) {
-                all_pairs.push(pair);
-                new_count += 1;
+        if crate::config::ENABLE_MENTIONS {
+            let mention_result = self.discover_mention_markets().await;
+            for pair in mention_result.pairs {
+                if !all_pairs.iter().any(|p| *p.kalshi_market_ticker == *pair.kalshi_market_ticker) {
+                    all_pairs.push(pair);
+                    new_count += 1;
+                }
             }
         }
 
@@ -326,7 +346,7 @@ impl DiscoveryClient {
     async fn discover_league(&self, config: &LeagueConfig, cache: Option<&DiscoveryCache>) -> DiscoveryResult {
         info!("🔍 Discovering {} markets...", config.league_code);
 
-        let market_types = [MarketType::Moneyline, MarketType::Spread, MarketType::Total, MarketType::Btts];
+        let market_types = crate::config::ENABLED_MARKET_TYPES;
 
         // Parallel discovery across market types
         let type_futures: Vec<_> = market_types.iter()
@@ -365,6 +385,7 @@ impl DiscoveryClient {
             MarketType::Total => config.kalshi_series_total,
             MarketType::Btts => config.kalshi_series_btts,
             MarketType::Mention => None,  // Mention markets are discovered separately
+            MarketType::Btc15m => None,   // BTC 15m markets are discovered separately
         }
     }
     
@@ -559,7 +580,153 @@ impl DiscoveryClient {
                 // Mention markets don't use this method
                 base
             }
+            MarketType::Btc15m => {
+                // BTC 15m markets don't use this method - handled separately
+                base
+            }
         }
+    }
+    
+    /// Discover BTC 15m Up/Down recurring markets
+    /// These markets are created every 15 minutes and resolve based on BTC price movement
+    pub async fn discover_btc15m_markets(&self) -> DiscoveryResult {
+        info!("₿ Discovering BTC 15m Up/Down markets...");
+        
+        let mut result = DiscoveryResult::default();
+        
+        // Step 1: Fetch open Kalshi KXBTC15M markets using existing get_markets_by_series
+        let kalshi_markets = {
+            let _permit = self.kalshi_semaphore.acquire().await.ok();
+            self.kalshi_limiter.until_ready().await;
+            // Fetch more markets (100) to ensure we get current ones even if API sorts by newest
+            match self.kalshi.get_markets_by_series(crate::config::KALSHI_BTC15M_SERIES, 100).await {
+                Ok(mut markets) => {
+                    let now = Utc::now();
+                    let cutoff = now + chrono::Duration::hours(4);
+                    
+                    let total = markets.len();
+                    // Filter: Open/Upcoming within next 4 hours, and not already closed
+                    markets.retain(|m| m.close_time > now && m.open_time < cutoff);
+                    
+                    info!("  ✅ Found {} Kalshi BTC 15m markets (filtered from {})", markets.len(), total);
+                    markets
+                }
+                Err(e) => {
+                    result.errors.push(format!("Kalshi BTC15M fetch failed: {}", e));
+                    warn!("  ❌ Kalshi BTC15M fetch failed: {}", e);
+                    return result;
+                }
+            }
+        };
+        
+        if kalshi_markets.is_empty() {
+            info!("  ℹ️ No open Kalshi BTC 15m markets found");
+            return result;
+        }
+        
+        result.kalshi_events_found = kalshi_markets.len();
+        
+        // Step 2: For each Kalshi market, find corresponding Polymarket event
+        for market in &kalshi_markets {
+            // Parse Kalshi ticker to extract event timestamp
+            // Ticker format: KXBTC15M-{ddMMMyyHHmm}-{seq} e.g., KXBTC15M-25DEC260015-15
+            let poly_slug = match Self::build_poly_slug_from_kalshi_btc15m(&market.ticker) {
+                Some(slug) => slug,
+                None => {
+                    warn!("  ⚠️ Could not parse Kalshi ticker: {}", market.ticker);
+                    continue;
+                }
+            };
+            
+            // Step 3: Lookup Polymarket event via Gamma API (using existing lookup_market method)
+            let _permit = self.gamma_semaphore.acquire().await.ok();
+            match self.gamma.lookup_market(&poly_slug).await {
+                Ok(Some((yes_token, no_token))) => {
+                    // Create market pair
+                    // Note: For BTC15m, Kalshi YES = Up = Polymarket Up, Kalshi NO = Down = Polymarket Down
+                    let pair = MarketPair {
+                        pair_id: format!("btc15m-{}", market.ticker).into(),
+                        league: "CRYPTO".into(),
+                        market_type: MarketType::Btc15m,
+                        description: market.title.clone().into(),
+                        kalshi_event_ticker: market.event_ticker.clone().into(),
+                        kalshi_market_ticker: market.ticker.clone().into(),
+                        poly_slug: poly_slug.clone().into(),
+                        poly_yes_token: yes_token.into(),
+                        poly_no_token: no_token.into(),
+                        line_value: market.floor_strike,
+                        team_suffix: None,
+                    };
+                    
+                    info!("  ✓ Matched: {} <-> {}", market.ticker, poly_slug);
+                    result.pairs.push(pair);
+                    result.poly_matches += 1;
+                }
+                Ok(None) => {
+                    result.poly_misses += 1;
+                    // This is common for future markets not yet on Polymarket
+                }
+                Err(e) => {
+                    warn!("  ⚠️ Gamma lookup failed for {}: {}", poly_slug, e);
+                    result.errors.push(format!("Gamma lookup for {} failed: {}", poly_slug, e));
+                }
+            }
+        }
+        
+        info!("₿ BTC 15m discovery complete: {} pairs matched, {} misses", 
+              result.poly_matches, result.poly_misses);
+        
+        result
+    }
+    
+    /// Build Polymarket slug from Kalshi BTC15M ticker
+    /// Input: KXBTC15M-25DEC260015-15 (Dec 26, 2025 at 00:15 ET)
+    /// Output: btc-updown-15m-{unix_timestamp}
+    fn build_poly_slug_from_kalshi_btc15m(ticker: &str) -> Option<String> {
+        // Parse format: KXBTC15M-{ddMMMyyHHmm}-{seq}
+        // Example: KXBTC15M-25DEC260015-15
+        let parts: Vec<&str> = ticker.split('-').collect();
+        if parts.len() < 2 || !parts[0].starts_with("KXBTC15M") {
+            return None;
+        }
+        
+        let date_part = parts[1]; // "25DEC260015" - ddMMMyyHHmm
+        if date_part.len() < 11 {
+            return None;
+        }
+        
+        // Parse date components
+        // Parse date components (Format: YYMMMddHHmm)
+        let year_short: u32 = date_part[0..2].parse().ok()?;
+        let month_str = &date_part[2..5]; // "DEC"
+        let day: u32 = date_part[5..7].parse().ok()?;
+        let hour: u32 = date_part[7..9].parse().ok()?;
+        let minute: u32 = date_part[9..11].parse().ok()?;
+        
+        let month = match month_str.to_uppercase().as_str() {
+            "JAN" => 1, "FEB" => 2, "MAR" => 3, "APR" => 4, "MAY" => 5, "JUN" => 6,
+            "JUL" => 7, "AUG" => 8, "SEP" => 9, "OCT" => 10, "NOV" => 11, "DEC" => 12,
+            _ => return None,
+        };
+        
+        let year = 2000 + year_short;
+        
+        // Convert to Unix timestamp (approximate - ET timezone)
+        // Use chrono for proper timezone handling
+        use chrono::{TimeZone, Utc, FixedOffset};
+        
+        // ET is UTC-5 (standard) or UTC-4 (daylight)
+        // For simplicity, use UTC-5 as a baseline
+        let et_offset = FixedOffset::west_opt(5 * 3600)?;
+        
+        let dt = et_offset
+            .with_ymd_and_hms(year as i32, month, day, hour, minute, 0)
+            .single()?;
+        
+        // Polymarket uses start time, Kalshi uses end time (15 min difference)
+        let unix_ts = dt.with_timezone(&Utc).timestamp() - 900;
+        
+        Some(format!("btc-updown-15m-{}", unix_ts))
     }
     
     /// Discover mention/"say" markets across Polymarket and Kalshi

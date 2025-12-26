@@ -320,6 +320,13 @@ impl KalshiApiClient {
         Ok(resp.markets)
     }
     
+    /// Get markets by series ticker (e.g., "KXBTC15M" for BTC 15m markets)
+    pub async fn get_markets_by_series(&self, series_ticker: &str, limit: u32) -> Result<Vec<KalshiMarket>> {
+        let path = format!("/markets?series_ticker={}&limit={}", series_ticker, limit);
+        let resp: KalshiMarketsResponse = self.get(&path).await?;
+        Ok(resp.markets)
+    }
+    
     /// Generic authenticated POST request
     async fn post<T: serde::de::DeserializeOwned, B: Serialize>(&self, path: &str, body: &B) -> Result<T> {
         let url = format!("{}{}", KALSHI_API_BASE, path);
@@ -435,6 +442,11 @@ pub struct KalshiWsMsgBody {
     pub price: Option<i64>,
     pub delta: Option<i64>,
     pub side: Option<String>,
+    // Ticker fields
+    pub yes_bid: Option<i64>,
+    pub yes_ask: Option<i64>,
+    pub no_bid: Option<i64>,
+    pub no_ask: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -451,19 +463,121 @@ struct SubscribeParams {
 }
 
 // =============================================================================
+// Local Order Book Tracking
+// =============================================================================
+
+/// Local order book state for a single market
+/// Tracks BIDS only (since that's what Kalshi sends)
+#[derive(Default)]
+struct LocalOrderBook {
+    /// YES bids: price -> quantity
+    yes_bids: std::collections::BTreeMap<i64, i64>,
+    /// NO bids: price -> quantity
+    no_bids: std::collections::BTreeMap<i64, i64>,
+}
+
+impl LocalOrderBook {
+    fn new() -> Self {
+        Self {
+            yes_bids: std::collections::BTreeMap::new(),
+            no_bids: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// Update from snapshot (clears previous state)
+    fn apply_snapshot(&mut self, body: &KalshiWsMsgBody) {
+        self.yes_bids.clear();
+        if let Some(levels) = &body.yes {
+            for l in levels {
+                if l.len() >= 2 {
+                    self.yes_bids.insert(l[0], l[1]);
+                }
+            }
+        }
+
+        self.no_bids.clear();
+        if let Some(levels) = &body.no {
+            for l in levels {
+                if l.len() >= 2 {
+                    self.no_bids.insert(l[0], l[1]);
+                }
+            }
+        }
+    }
+
+    /// Update from delta
+    fn apply_delta(&mut self, body: &KalshiWsMsgBody) {
+        if let Some(levels) = &body.yes {
+            for l in levels {
+                if l.len() >= 2 {
+                    let price = l[0];
+                    let qty = l[1];
+                    if qty == 0 {
+                        self.yes_bids.remove(&price);
+                    } else {
+                        self.yes_bids.insert(price, qty);
+                    }
+                }
+            }
+        }
+
+        if let Some(levels) = &body.no {
+            for l in levels {
+                if l.len() >= 2 {
+                    let price = l[0];
+                    let qty = l[1];
+                    if qty == 0 {
+                        self.no_bids.remove(&price);
+                    } else {
+                        self.no_bids.insert(price, qty);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Get best prices (YES ask, NO ask)
+    /// Returns (yes_ask, no_ask, yes_size, no_size)
+    /// Remember: To buy YES, we pay (100 - Best NO Bid)
+    ///           To buy NO, we pay (100 - Best YES Bid)
+    fn get_best_asks(&self) -> (PriceCents, PriceCents, SizeCents, SizeCents) {
+        // YES Ask = 100 - Best NO Bid
+        let (yes_ask, yes_size) = self.no_bids.iter().next_back() // Highest bid
+            .map(|(price, qty)| {
+                let ask = (100 - price) as PriceCents;
+                let size = (qty * price / 100) as SizeCents;
+                (ask, size)
+            })
+            .unwrap_or((0, 0));
+
+        // NO Ask = 100 - Best YES Bid
+        let (no_ask, no_size) = self.yes_bids.iter().next_back() // Highest bid
+            .map(|(price, qty)| {
+                let ask = (100 - price) as PriceCents;
+                let size = (qty * price / 100) as SizeCents;
+                (ask, size)
+            })
+            .unwrap_or((0, 0));
+
+        (yes_ask, no_ask, yes_size, no_size)
+    }
+}
+
+// =============================================================================
 // WebSocket Runner
 // =============================================================================
 
-/// WebSocket runner
+/// WebSocket runner with max duration for periodic refresh
 pub async fn run_ws(
     config: &KalshiConfig,
     state: Arc<GlobalState>,
     exec_tx: mpsc::Sender<FastExecutionRequest>,
     threshold_cents: PriceCents,
+    max_duration_secs: u64,
 ) -> Result<()> {
     let tickers: Vec<String> = state.markets.iter()
         .take(state.market_count())
-        .filter_map(|m| m.pair.as_ref().map(|p| p.kalshi_market_ticker.to_string()))
+        .filter_map(|m| m.pair().map(|p| p.kalshi_market_ticker.to_string()))
         .collect();
 
     if tickers.is_empty() {
@@ -496,20 +610,25 @@ pub async fn run_ws(
 
     let (mut write, mut read) = ws_stream.split();
 
-    // Subscribe to all tickers
+    // Subscribe to orderbook_delta to get all updates
     let subscribe_msg = SubscribeCmd {
         id: 1,
         cmd: "subscribe",
         params: SubscribeParams {
-            channels: vec!["orderbook_delta"],
+            channels: vec!["orderbook_delta"], 
             market_tickers: tickers.clone(),
         },
     };
 
     write.send(Message::Text(serde_json::to_string(&subscribe_msg)?)).await?;
-    info!("[KALSHI] Subscribed to {} markets", tickers.len());
+    info!("[KALSHI] Subscribed to {} markets (orderbook_delta)", tickers.len());
 
     let clock = NanoClock::new();
+    let start_time = std::time::Instant::now();
+    let max_duration = Duration::from_secs(max_duration_secs);
+
+    // Local order books: Market ID -> LocalOrderBook
+    let mut local_books: std::collections::HashMap<u16, LocalOrderBook> = std::collections::HashMap::new();
 
     while let Some(msg) = read.next().await {
         match msg {
@@ -518,36 +637,37 @@ pub async fn run_ws(
                     Ok(kalshi_msg) => {
                         let ticker = kalshi_msg.msg.as_ref()
                             .and_then(|m| m.market_ticker.as_ref());
-
+                        
                         let Some(ticker) = ticker else { continue };
                         let ticker_hash = fxhash_str(ticker);
 
-                        let Some(&market_id) = state.kalshi_to_id.get(&ticker_hash) else { continue };
+                        let Some(market_id) = state.kalshi_to_id.read().unwrap().get(&ticker_hash).copied() else { continue };
                         let market = &state.markets[market_id as usize];
+                        
+                        // Get or create local book
+                        let book = local_books.entry(market_id).or_insert_with(LocalOrderBook::new);
 
-                        match kalshi_msg.msg_type.as_str() {
-                            "orderbook_snapshot" => {
-                                if let Some(body) = &kalshi_msg.msg {
-                                    process_kalshi_snapshot(market, body);
-
-                                    // Check for arbs
-                                    let arb_mask = market.check_arbs(threshold_cents);
-                                    if arb_mask != 0 {
-                                        send_kalshi_arb_request(market_id, market, arb_mask, &exec_tx, &clock).await;
-                                    }
+                        if let Some(body) = &kalshi_msg.msg {
+                            match kalshi_msg.msg_type.as_str() {
+                                "orderbook_snapshot" => {
+                                    // info!("[KALSHI] 📸 Snapshot for {}", ticker);
+                                    book.apply_snapshot(body);
                                 }
-                            }
-                            "orderbook_delta" => {
-                                if let Some(body) = &kalshi_msg.msg {
-                                    process_kalshi_delta(market, body);
-
-                                    let arb_mask = market.check_arbs(threshold_cents);
-                                    if arb_mask != 0 {
-                                        send_kalshi_arb_request(market_id, market, arb_mask, &exec_tx, &clock).await;
-                                    }
+                                "orderbook_delta" => {
+                                    book.apply_delta(body);
                                 }
+                                _ => continue,
                             }
-                            _ => {}
+                            
+                            // Update global state
+                            let (yes_ask, no_ask, yes_size, no_size) = book.get_best_asks();
+                            market.kalshi.store(yes_ask, no_ask, yes_size, no_size);
+                            
+                            // Check for arbs
+                            let arb_mask = market.check_arbs(threshold_cents);
+                            if arb_mask != 0 {
+                                send_kalshi_arb_request(market_id, market, arb_mask, &exec_tx, &clock).await;
+                            }
                         }
                     }
                     Err(e) => {
@@ -565,111 +685,15 @@ pub async fn run_ws(
             }
             _ => {}
         }
+        
+        // Periodic refresh: reconnect to pick up new markets
+        if start_time.elapsed() > max_duration {
+            info!("[KALSHI] Max duration reached, reconnecting for fresh subscriptions...");
+            break;
+        }
     }
 
     Ok(())
-}
-
-/// Process Kalshi orderbook snapshot
-/// Note: Kalshi sends BIDS - to buy YES you pay (100 - best_NO_bid), to buy NO you pay (100 - best_YES_bid)
-#[inline]
-fn process_kalshi_snapshot(market: &crate::types::AtomicMarketState, body: &KalshiWsMsgBody) {
-    // Find best YES bid (highest price) - this determines NO ask
-    let (no_ask, no_size) = body.yes.as_ref()
-        .and_then(|levels| {
-            levels.iter()
-                .filter_map(|l| {
-                    if l.len() >= 2 && l[1] > 0 {  // Has quantity
-                        Some((l[0], l[1]))  // (price, qty)
-                    } else {
-                        None
-                    }
-                })
-                .max_by_key(|(p, _)| *p)  // Highest bid
-                .map(|(price, qty)| {
-                    let ask = (100 - price) as PriceCents;  // To buy NO, pay 100 - YES_bid
-                    let size = (qty * price / 100) as SizeCents;
-                    (ask, size)
-                })
-        })
-        .unwrap_or((0, 0));
-
-    // Find best NO bid (highest price) - this determines YES ask
-    let (yes_ask, yes_size) = body.no.as_ref()
-        .and_then(|levels| {
-            levels.iter()
-                .filter_map(|l| {
-                    if l.len() >= 2 && l[1] > 0 {
-                        Some((l[0], l[1]))
-                    } else {
-                        None
-                    }
-                })
-                .max_by_key(|(p, _)| *p)
-                .map(|(price, qty)| {
-                    let ask = (100 - price) as PriceCents;  // To buy YES, pay 100 - NO_bid
-                    let size = (qty * price / 100) as SizeCents;
-                    (ask, size)
-                })
-        })
-        .unwrap_or((0, 0));
-
-    // Store
-    market.kalshi.store(yes_ask, no_ask, yes_size, no_size);
-}
-
-/// Process Kalshi orderbook delta
-/// Note: Deltas update bid levels; we recompute asks from best bids
-#[inline]
-fn process_kalshi_delta(market: &crate::types::AtomicMarketState, body: &KalshiWsMsgBody) {
-    // For deltas, recompute from snapshot-like format
-    // Kalshi deltas have yes/no as arrays of [price, new_qty]
-    let (current_yes, current_no, current_yes_size, current_no_size) = market.kalshi.load();
-
-    // Process YES bid updates (affects NO ask)
-    let (no_ask, no_size) = if let Some(levels) = &body.yes {
-        // Find best (highest) YES bid with non-zero quantity
-        levels.iter()
-            .filter_map(|l| {
-                if l.len() >= 2 && l[1] > 0 {
-                    Some((l[0], l[1]))
-                } else {
-                    None
-                }
-            })
-            .max_by_key(|(p, _)| *p)
-            .map(|(price, qty)| {
-                let ask = (100 - price) as PriceCents;
-                let size = (qty * price / 100) as SizeCents;
-                (ask, size)
-            })
-            .unwrap_or((current_no, current_no_size))
-    } else {
-        (current_no, current_no_size)
-    };
-
-    // Process NO bid updates (affects YES ask)
-    let (yes_ask, yes_size) = if let Some(levels) = &body.no {
-        levels.iter()
-            .filter_map(|l| {
-                if l.len() >= 2 && l[1] > 0 {
-                    Some((l[0], l[1]))
-                } else {
-                    None
-                }
-            })
-            .max_by_key(|(p, _)| *p)
-            .map(|(price, qty)| {
-                let ask = (100 - price) as PriceCents;
-                let size = (qty * price / 100) as SizeCents;
-                (ask, size)
-            })
-            .unwrap_or((current_yes, current_yes_size))
-    } else {
-        (current_yes, current_yes_size)
-    };
-
-    market.kalshi.store(yes_ask, no_ask, yes_size, no_size);
 }
 
 /// Send arb request from Kalshi handler

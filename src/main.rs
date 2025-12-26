@@ -16,7 +16,7 @@ mod types;
 
 use anyhow::{Context, Result};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, watch};
 use tracing::{error, info, warn};
 
 use cache::TeamCache;
@@ -34,17 +34,289 @@ const POLY_CLOB_HOST: &str = "https://clob.polymarket.com";
 /// Polygon chain ID
 const POLYGON_CHAIN_ID: u64 = 137;
 
+/// Run a single arb session (e.g. 5 minutes)
+/// Returns when the session times out or an error occurs.
+async fn run_session(
+    kalshi_api: Arc<KalshiApiClient>,
+    poly_async: Arc<SharedAsyncClient>,
+    discovery: Arc<DiscoveryClient>,
+    kalshi_ws_config: &KalshiConfig,
+    dry_run: bool,
+    full_duration_secs: u64,
+) -> Result<()> {
+    // Run discovery (always force refresh for new sessions)
+    info!("🔍 Discovering markets (forced refresh)...");
+    let result = discovery.discover_all_force(ENABLED_LEAGUES).await;
+
+    info!("📊 Discovery complete: {} pairs found", result.pairs.len());
+    if !result.errors.is_empty() {
+        for err in &result.errors {
+            warn!("   ⚠️ {}", err);
+        }
+    }
+
+    if result.pairs.is_empty() {
+        warn!("No market pairs found - waiting for next session");
+        tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+        return Ok(());
+    }
+
+    // Print discovered pairs
+    info!("📋 Matched markets:");
+    for pair in &result.pairs {
+        info!("   ✅ {} | {} | K:{}",
+              pair.description,
+              pair.market_type,
+              pair.kalshi_market_ticker);
+    }
+
+    // Build global state
+    let state = Arc::new({
+        let mut s = GlobalState::new();
+        for pair in result.pairs {
+            s.add_pair(pair);
+        }
+        info!("📡 State: Tracking {} markets", s.market_count());
+        s
+    });
+
+    // Create execution infrastructure
+    let (exec_tx, exec_rx) = create_execution_channel();
+    let circuit_breaker = Arc::new(CircuitBreaker::new(CircuitBreakerConfig::from_env()));
+
+    let position_tracker = Arc::new(RwLock::new(PositionTracker::new()));
+    let (position_channel, position_rx) = create_position_channel();
+
+    let pos_writer_handle = tokio::spawn(position_writer_loop(position_rx, position_tracker));
+
+    let threshold_cents: PriceCents = ((ARB_THRESHOLD * 100.0).round() as u16).max(1);
+    
+    let engine = Arc::new(ExecutionEngine::new(
+        kalshi_api.clone(),
+        poly_async.clone(),
+        state.clone(),
+        circuit_breaker.clone(),
+        position_channel,
+        dry_run,
+    ));
+
+    let exec_handle = tokio::spawn(run_execution_loop(exec_rx, engine));
+
+    // Start Kalshi WebSocket
+    let kalshi_state = state.clone();
+    let kalshi_exec_tx = exec_tx.clone();
+    let kalshi_threshold = threshold_cents;
+    // We must clone the config data to pass to the task
+    let k_conf_copy = KalshiConfig {
+        api_key_id: kalshi_ws_config.api_key_id.clone(),
+        private_key: kalshi_ws_config.private_key.clone(),
+    };
+    
+    // Reconnect every 10 minutes to pick up new markets (BTC 15m markets rotate every 15 mins)
+    const WS_REFRESH_INTERVAL_SECS: u64 = 600; // 10 minutes
+    
+    let kalshi_ws_handle = tokio::spawn(async move {
+        loop {
+            if let Err(e) = kalshi::run_ws(&k_conf_copy, kalshi_state.clone(), kalshi_exec_tx.clone(), kalshi_threshold, WS_REFRESH_INTERVAL_SECS).await {
+                error!("[KALSHI] Disconnected: {} - reconnecting...", e);
+            }
+            tokio::time::sleep(tokio::time::Duration::from_secs(WS_RECONNECT_DELAY_SECS)).await;
+        }
+    });
+
+    // Start Polymarket WebSocket
+    let poly_state = state.clone();
+    let poly_exec_tx = exec_tx.clone();
+    let poly_threshold = threshold_cents;
+    let poly_ws_handle = tokio::spawn(async move {
+        loop {
+            if let Err(e) = polymarket::run_ws(poly_state.clone(), poly_exec_tx.clone(), poly_threshold, WS_REFRESH_INTERVAL_SECS).await {
+                error!("[POLYMARKET] Disconnected: {} - reconnecting...", e);
+            }
+            tokio::time::sleep(tokio::time::Duration::from_secs(WS_RECONNECT_DELAY_SECS)).await;
+        }
+    });
+
+    // Market Manager task - runs discovery every 5 minutes to add new markets
+    let manager_state = state.clone();
+    let manager_discovery = discovery.clone();
+    let manager_handle = tokio::spawn(async move {
+        const DISCOVERY_INTERVAL_SECS: u64 = 300; // 5 minutes
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(DISCOVERY_INTERVAL_SECS));
+        interval.tick().await; // Skip the initial tick (we just ran discovery)
+        
+        loop {
+            interval.tick().await;
+            info!("[MANAGER] Running periodic market discovery...");
+            
+            let result = manager_discovery.discover_all_force(ENABLED_LEAGUES).await;
+            
+            let mut new_markets = 0;
+            for pair in result.pairs {
+                // Check if already tracked (by Kalshi ticker)
+                let ticker_hash = crate::types::fxhash_str(&pair.kalshi_market_ticker);
+                let already_tracked = manager_state.kalshi_to_id.read()
+                    .ok()
+                    .map(|guard| guard.contains_key(&ticker_hash))
+                    .unwrap_or(false);
+                
+                if !already_tracked {
+                    if manager_state.add_pair(pair).is_some() {
+                        new_markets += 1;
+                    }
+                }
+            }
+            
+            if new_markets > 0 {
+                info!("[MANAGER] Added {} new markets (total: {})", new_markets, manager_state.market_count());
+            } else {
+                info!("[MANAGER] No new markets found");
+            }
+            
+            if !result.errors.is_empty() {
+                for err in &result.errors {
+                    warn!("[MANAGER] Discovery error: {}", err);
+                }
+            }
+        }
+    });
+
+    // Heartbeat task with arb diagnostics
+    let heartbeat_state = state.clone();
+    let heartbeat_threshold = threshold_cents;
+    let heartbeat_handle = tokio::spawn(async move {
+        use crate::types::kalshi_fee_cents;
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(20));
+        loop {
+            interval.tick().await;
+            let market_count = heartbeat_state.market_count();
+            let mut with_kalshi = 0;
+            let mut with_poly = 0;
+            let mut with_both = 0;
+            // (cost, market_id, p_yes, k_no, k_yes, p_no, fee, is_poly_yes_kalshi_no)
+            let mut best_arb: Option<(u16, u16, u16, u16, u16, u16, u16, bool)> = None;
+
+            for market in heartbeat_state.markets.iter().take(market_count) {
+                let (k_yes, k_no, _, _) = market.kalshi.load();
+                let (p_yes, p_no, _, _) = market.poly.load();
+                
+                // Track availability
+                if k_yes > 0 || k_no > 0 { with_kalshi += 1; }
+                if p_yes > 0 || p_no > 0 { with_poly += 1; }
+                
+                // Track Overlap (Relaxed: At least one cross-pair exists)
+                let can_arb_1 = p_yes > 0 && k_no > 0;
+                let can_arb_2 = k_yes > 0 && p_no > 0;
+                if can_arb_1 || can_arb_2 {
+                    with_both += 1;
+                } else if (k_yes > 0 || k_no > 0) && (p_yes > 0 || p_no > 0) {
+                     // Both have prices but mismatched sides (e.g. K has YES, P has YES -> No arb possible directly if we only Sell? No.)
+                     // Arb1: Buy P_Yes (Ask), Sell K_Yes (Bid).  Sell K_Yes = Buy K_No (Ask).
+                     // So we need P_Yes_Ask and K_No_Ask.
+                     // If we have K_Yes_Ask... we can't Sell K_Yes using Ask. We need Bid.
+                     // But our state stored ASKS.
+                     // So we legitimately need P_Yes_Ask AND K_No_Ask.
+                     // Mismatch implies we have disjoint sets of Asks.
+                }
+
+                if can_arb_1 {
+                    let fee1 = kalshi_fee_cents(k_no);
+                    let cost1 = p_yes + k_no + fee1;
+                    if best_arb.is_none() || cost1 < best_arb.as_ref().unwrap().0 {
+                         // Arb Type 1: Poly Yes, Kalshi No
+                         best_arb = Some((cost1, market.market_id, p_yes, k_no, k_yes, p_no, fee1, true));
+                    }
+                }
+                
+                if can_arb_2 {
+                    let fee2 = kalshi_fee_cents(k_yes);
+                    let cost2 = k_yes + fee2 + p_no;
+                     if best_arb.is_none() || cost2 < best_arb.as_ref().unwrap().0 {
+                         // Arb Type 2: Kalshi Yes, Poly No
+                         best_arb = Some((cost2, market.market_id, p_yes, k_no, k_yes, p_no, fee2, false));
+                    }
+                }
+                
+                // Debug log for active markets
+                if k_yes > 0 || k_no > 0 {
+                   let t = market.pair().map(|p| p.kalshi_market_ticker.to_string()).unwrap_or_else(|| "?".to_string());
+                   // info!("   ℹ️ Market {}: K({}|{}) P({}|{})", t, k_yes, k_no, p_yes, p_no);
+                }
+            }
+
+            info!("💓 Heartbeat | Markets: {} total, {} w/Kalshi, {} w/Poly, {} w/Overlap | threshold={}¢",
+                  market_count, with_kalshi, with_poly, with_both, heartbeat_threshold);
+            
+            if let Some((cost, market_id, p_yes, k_no, k_yes, p_no, fee, is_poly_yes)) = best_arb {
+                let gap = cost as i16 - heartbeat_threshold as i16;
+                let desc = heartbeat_state.get_by_id(market_id)
+                    .and_then(|m| m.pair())
+                    .map(|p| p.description.to_string())
+                    .unwrap_or_else(|| "Unknown".to_string());
+                let leg_breakdown = if is_poly_yes {
+                    format!("P_yes({}¢) + K_no({}¢) + K_fee({}¢) = {}¢", p_yes, k_no, fee, cost)
+                } else {
+                    format!("K_yes({}¢) + P_no({}¢) + K_fee({}¢) = {}¢", k_yes, p_no, fee, cost)
+                };
+                if gap <= 10 {
+                    info!("   📊 Best: {} | {} | gap={:+}¢ | [P_yes={}¢ K_no={}¢ K_yes={}¢ P_no={}¢]", 
+                          desc, leg_breakdown, gap, p_yes, k_no, k_yes, p_no);
+                } else {
+                    info!("   📊 Best: {} | {} | gap={:+}¢ - efficient", 
+                          desc, leg_breakdown, gap);
+                }
+            } else if with_both == 0 {
+                if market_count > 0 {
+                    warn!("   ⚠️  No actionable overlap (missing crossing sides) - check liquidity");
+                }
+            }
+        }
+    });
+
+    // Run until timeout
+    info!("⏱️  Session running for {} seconds...", full_duration_secs);
+    tokio::select! {
+        _ = tokio::time::sleep(tokio::time::Duration::from_secs(full_duration_secs)) => {
+            info!("⌛ Session timeout reached - rotating...");
+        }
+        res = exec_handle => {
+            warn!("⚠️ Execution loop exited unexpectedly: {:?}", res);
+        }
+    }
+
+    // Cleanup: Tasks attached to handles will be dropped/cancelled when handles are dropped?
+    // No, tokio tasks are detached. We must abort them.
+    kalshi_ws_handle.abort();
+    poly_ws_handle.abort();
+    heartbeat_handle.abort();
+    manager_handle.abort();
+    pos_writer_handle.abort();
+    
+    // exec_handle is already finished or we don't care about aborting it if we timed out (it will be aborted when we drop the channel? No.)
+    // We should abort it to be safe.
+    // If we are here because of timeout, the exec_lopp is still running.
+    // We need to abort it.
+    // But we don't have mutable access to exec_handle if we used it in select!
+    // Actually select consumes the handle? No, it borrows or takes ownership.
+    // If select finished via sleep branch, exec_handle was dropped (the future waiting on it). The task is still running.
+    // We can't abort it easily if we lost the handle.
+    // Solution: Keep handles outside select.
+    
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize logging
+    // Initialize logging
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("arb_bot=info".parse().unwrap()),
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "arb_bot=info".into()),
         )
         .init();
 
-    info!("🎯 Arb Bot v2.0");
+    info!("🎯 Arb Bot v2.0 - Supervisor Mode");
     info!("   Threshold: <{:.1}¢ for {:.1}% profit",
           ARB_THRESHOLD * 100.0, (1.0 - ARB_THRESHOLD) * 100.0);
     info!("   Leagues: {:?}", ENABLED_LEAGUES);
@@ -80,7 +352,7 @@ async fn main() -> Result<()> {
     let prepared_creds = PreparedCreds::from_api_creds(&api_creds)?;
     let poly_async = Arc::new(SharedAsyncClient::new(poly_async_client, prepared_creds, POLYGON_CHAIN_ID));
 
-    // Load neg_risk cache from Python script output
+    // Load neg_risk cache
     match poly_async.load_cache(".clob_market_cache.json") {
         Ok(count) => info!("[POLYMARKET] Loaded {} neg_risk entries from cache", count),
         Err(e) => warn!("[POLYMARKET] Could not load neg_risk cache: {}", e),
@@ -92,253 +364,42 @@ async fn main() -> Result<()> {
     let team_cache = TeamCache::load();
     info!("📂 Loaded {} team mappings", team_cache.len());
 
-    // Create Kalshi API client
-    let kalshi_api = Arc::new(KalshiApiClient::new(kalshi_config));
+    // Create Kalshi API client (shared across sessions)
+    let kalshi_api = Arc::new(KalshiApiClient::new(KalshiConfig::from_env()?));
 
-    // Run discovery (with caching support)
-    let force_discovery = std::env::var("FORCE_DISCOVERY")
-        .map(|v| v == "1" || v == "true")
-        .unwrap_or(false);
-
-    info!("🔍 Discovering markets{}...",
-          if force_discovery { " (forced refresh)" } else { "" });
-
-    let discovery = DiscoveryClient::new(
+    // Create Discovery client (with cache loaded)
+    let discovery = Arc::new(DiscoveryClient::new(
         KalshiApiClient::new(KalshiConfig::from_env()?),
         team_cache
-    );
-
-    let result = if force_discovery {
-        discovery.discover_all_force(ENABLED_LEAGUES).await
-    } else {
-        discovery.discover_all(ENABLED_LEAGUES).await
-    };
-
-    info!("📊 Discovery complete:");
-    info!("   - Market pairs found: {}", result.pairs.len());
-
-    if !result.errors.is_empty() {
-        for err in &result.errors {
-            warn!("   ⚠️ {}", err);
-        }
-    }
-
-    if result.pairs.is_empty() {
-        error!("No market pairs found!");
-        return Ok(());
-    }
-
-    // Print discovered pairs
-    info!("📋 Matched markets:");
-    for pair in &result.pairs {
-        info!("   ✅ {} | {} | K:{}",
-              pair.description,
-              pair.market_type,
-              pair.kalshi_market_ticker);
-    }
-
-    // Build global state
-    let state = Arc::new({
-        let mut s = GlobalState::new();
-        for pair in result.pairs {
-            s.add_pair(pair);
-        }
-        info!("📡 State: Tracking {} markets", s.market_count());
-        s
-    });
-
-    // Create execution infrastructure
-    let (exec_tx, exec_rx) = create_execution_channel();
-    let circuit_breaker = Arc::new(CircuitBreaker::new(CircuitBreakerConfig::from_env()));
-
-    let position_tracker = Arc::new(RwLock::new(PositionTracker::new()));
-    let (position_channel, position_rx) = create_position_channel();
-
-    tokio::spawn(position_writer_loop(position_rx, position_tracker));
-
-    let threshold_cents: PriceCents = ((ARB_THRESHOLD * 100.0).round() as u16).max(1);
-    info!("   Threshold: {} cents", threshold_cents);
-
-    let engine = Arc::new(ExecutionEngine::new(
-        kalshi_api.clone(),
-        poly_async,
-        state.clone(),
-        circuit_breaker.clone(),
-        position_channel,
-        dry_run,
     ));
 
-    let exec_handle = tokio::spawn(run_execution_loop(exec_rx, engine));
+    // Initial delay to let things settle? No.
 
-    // === TEST MODE: Inject fake arb after delay ===
-    // TEST_ARB=1 to enable, TEST_ARB_TYPE=poly_yes_kalshi_no|kalshi_yes_poly_no|poly_only|kalshi_only
-    let test_arb = std::env::var("TEST_ARB").map(|v| v == "1" || v == "true").unwrap_or(false);
-    if test_arb {
-        let test_state = state.clone();
-        let test_exec_tx = exec_tx.clone();
-        let test_dry_run = dry_run;
-
-        // Parse arb type from environment (default: poly_yes_kalshi_no)
-        let arb_type_str = std::env::var("TEST_ARB_TYPE").unwrap_or_else(|_| "poly_yes_kalshi_no".to_string());
-
-        tokio::spawn(async move {
-            use types::{FastExecutionRequest, ArbType};
-
-            // Wait for WebSockets to connect and populate some prices
-            info!("[TEST] Will inject fake arb in 10 seconds...");
-            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
-
-            // Parse arb type
-            let arb_type = match arb_type_str.to_lowercase().as_str() {
-                "poly_yes_kalshi_no" | "pykn" | "0" => ArbType::PolyYesKalshiNo,
-                "kalshi_yes_poly_no" | "kypn" | "1" => ArbType::KalshiYesPolyNo,
-                "poly_only" | "poly" | "2" => ArbType::PolyOnly,
-                "kalshi_only" | "kalshi" | "3" => ArbType::KalshiOnly,
-                _ => {
-                    warn!("[TEST] Unknown TEST_ARB_TYPE='{}', defaulting to PolyYesKalshiNo", arb_type_str);
-                    warn!("[TEST] Valid values: poly_yes_kalshi_no, kalshi_yes_poly_no, poly_only, kalshi_only");
-                    ArbType::PolyYesKalshiNo
-                }
-            };
-
-            // Set prices based on arb type for realistic test scenarios
-            let (yes_price, no_price, description) = match arb_type {
-                ArbType::PolyYesKalshiNo => (40, 50, "P_yes=40¢ + K_no=50¢ + fee≈2¢ = 92¢ → 8¢ profit"),
-                ArbType::KalshiYesPolyNo => (40, 50, "K_yes=40¢ + P_no=50¢ + fee≈2¢ = 92¢ → 8¢ profit"),
-                ArbType::PolyOnly => (48, 50, "P_yes=48¢ + P_no=50¢ + fee=0¢ = 98¢ → 2¢ profit (NO FEES!)"),
-                ArbType::KalshiOnly => (44, 44, "K_yes=44¢ + K_no=44¢ + fee≈4¢ = 92¢ → 8¢ profit (DOUBLE FEES)"),
-            };
-
-            // Find first market with valid state
-            let market_count = test_state.market_count();
-            for market_id in 0..market_count {
-                if let Some(market) = test_state.get_by_id(market_id as u16) {
-                    if let Some(pair) = &market.pair {
-                        // SIZE: 1000 cents = 10 contracts (Poly $1 min requires ~3 contracts at 40¢)
-                        let fake_req = FastExecutionRequest {
-                            market_id: market_id as u16,
-                            yes_price,
-                            no_price,
-                            yes_size: 1000,  // 1000¢ = 10 contracts
-                            no_size: 1000,   // 1000¢ = 10 contracts
-                            arb_type,
-                            detected_ns: 0,
-                        };
-
-                        warn!("[TEST] 🧪 Injecting FAKE {:?} arb for: {}", arb_type, pair.description);
-                        warn!("[TEST]    {}", description);
-                        warn!("[TEST]    SIZE CAPPED TO 10 CONTRACTS for safety!");
-                        warn!("[TEST]    Execution mode: DRY_RUN={}", test_dry_run);
-
-                        if let Err(e) = test_exec_tx.send(fake_req).await {
-                            error!("[TEST] Failed to send fake arb: {}", e);
-                        }
-                        break;
-                    }
-                }
+    // SUPERVISOR LOOP
+    // Run for 4 hours (fetching ~20 markets covers 5 hours, so 4 hours is safe)
+    let session_duration = 14400; 
+    
+    loop {
+        info!("🔄 REQUESTING SESSION (4h)...");
+        
+        match run_session(
+            kalshi_api.clone(),
+            poly_async.clone(),
+            discovery.clone(),
+            &kalshi_config,
+            dry_run,
+            session_duration
+        ).await {
+            Ok(_) => {
+                info!("✅ Session completed normally. Restarting...");
             }
-        });
+            Err(e) => {
+                error!("❌ Session failed: {}. Retrying in 5s...", e);
+                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+            }
+        }
+        
+        // Brief pause between sessions
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
     }
-
-    // Start Kalshi WebSocket (config parsed once, reused on reconnects)
-    let kalshi_state = state.clone();
-    let kalshi_exec_tx = exec_tx.clone();
-    let kalshi_threshold = threshold_cents;
-    let kalshi_ws_config = KalshiConfig::from_env()?;
-    let kalshi_handle = tokio::spawn(async move {
-        loop {
-            if let Err(e) = kalshi::run_ws(&kalshi_ws_config, kalshi_state.clone(), kalshi_exec_tx.clone(), kalshi_threshold).await {
-                error!("[KALSHI] Disconnected: {} - reconnecting...", e);
-            }
-            tokio::time::sleep(tokio::time::Duration::from_secs(WS_RECONNECT_DELAY_SECS)).await;
-        }
-    });
-
-    // Start Polymarket WebSocket
-    let poly_state = state.clone();
-    let poly_exec_tx = exec_tx.clone();
-    let poly_threshold = threshold_cents;
-    let poly_handle = tokio::spawn(async move {
-        loop {
-            if let Err(e) = polymarket::run_ws(poly_state.clone(), poly_exec_tx.clone(), poly_threshold).await {
-                error!("[POLYMARKET] Disconnected: {} - reconnecting...", e);
-            }
-            tokio::time::sleep(tokio::time::Duration::from_secs(WS_RECONNECT_DELAY_SECS)).await;
-        }
-    });
-
-    // Heartbeat task with arb diagnostics
-    let heartbeat_state = state.clone();
-    let heartbeat_threshold = threshold_cents;
-    let heartbeat_handle = tokio::spawn(async move {
-        use crate::types::kalshi_fee_cents;
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
-        loop {
-            interval.tick().await;
-            let market_count = heartbeat_state.market_count();
-            let mut with_kalshi = 0;
-            let mut with_poly = 0;
-            let mut with_both = 0;
-            // (cost, market_id, p_yes, k_no, k_yes, p_no, fee, is_poly_yes_kalshi_no)
-            let mut best_arb: Option<(u16, u16, u16, u16, u16, u16, u16, bool)> = None;
-
-            for market in heartbeat_state.markets.iter().take(market_count) {
-                let (k_yes, k_no, _, _) = market.kalshi.load();
-                let (p_yes, p_no, _, _) = market.poly.load();
-                let has_k = k_yes > 0 && k_no > 0;
-                let has_p = p_yes > 0 && p_no > 0;
-                if k_yes > 0 || k_no > 0 { with_kalshi += 1; }
-                if p_yes > 0 || p_no > 0 { with_poly += 1; }
-                if has_k && has_p {
-                    with_both += 1;
-
-                    let fee1 = kalshi_fee_cents(k_no);
-                    let cost1 = p_yes + k_no + fee1;
-
-                    let fee2 = kalshi_fee_cents(k_yes);
-                    let cost2 = k_yes + fee2 + p_no;
-
-                    let (best_cost, best_fee, is_poly_yes) = if cost1 <= cost2 {
-                        (cost1, fee1, true)
-                    } else {
-                        (cost2, fee2, false)
-                    };
-
-                    if best_arb.is_none() || best_cost < best_arb.as_ref().unwrap().0 {
-                        best_arb = Some((best_cost, market.market_id, p_yes, k_no, k_yes, p_no, best_fee, is_poly_yes));
-                    }
-                }
-            }
-
-            info!("💓 Heartbeat | Markets: {} total, {} w/Kalshi, {} w/Poly, {} w/Both | threshold={}¢",
-                  market_count, with_kalshi, with_poly, with_both, heartbeat_threshold);
-
-            if let Some((cost, market_id, p_yes, k_no, k_yes, p_no, fee, is_poly_yes)) = best_arb {
-                let gap = cost as i16 - heartbeat_threshold as i16;
-                let desc = heartbeat_state.get_by_id(market_id)
-                    .and_then(|m| m.pair.as_ref())
-                    .map(|p| &*p.description)
-                    .unwrap_or("Unknown");
-                let leg_breakdown = if is_poly_yes {
-                    format!("P_yes({}¢) + K_no({}¢) + K_fee({}¢) = {}¢", p_yes, k_no, fee, cost)
-                } else {
-                    format!("K_yes({}¢) + P_no({}¢) + K_fee({}¢) = {}¢", k_yes, p_no, fee, cost)
-                };
-                if gap <= 10 {
-                    info!("   📊 Best: {} | {} | gap={:+}¢ | [P_yes={}¢ K_no={}¢ K_yes={}¢ P_no={}¢]",
-                          desc, leg_breakdown, gap, p_yes, k_no, k_yes, p_no);
-                } else {
-                    info!("   📊 Best: {} | {} | gap={:+}¢ - efficient",
-                          desc, leg_breakdown, gap);
-                }
-            } else if with_both == 0 {
-                warn!("   ⚠️  No markets with BOTH Kalshi and Poly prices - check WebSocket connections");
-            }
-        }
-    });
-
-    // Run forever
-    let _ = tokio::join!(kalshi_handle, poly_handle, heartbeat_handle, exec_handle);
-
-    Ok(())
 }

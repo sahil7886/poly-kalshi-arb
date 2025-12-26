@@ -1,0 +1,95 @@
+warning: unused import: `Context`
+ --> src/discovery.rs:8:14
+  |
+8 | use anyhow::{Context, Result};
+  |              ^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `yes_ask_size`
+   --> src/kalshi.rs:572:41
+    |
+572 | ...                   let yes_ask_size = 1000; // Ticker doesn't give size? Assume available or check orderbook?
+    |                           ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_yes_ask_size`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `process_kalshi_delta` is never used
+   --> src/kalshi.rs:684:4
+    |
+684 | fn process_kalshi_delta(market: &crate::types::AtomicMarketState, body: &KalshiWsMsgBody) {
+    |    ^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `arb-bot` (lib) generated 3 warnings (run `cargo fix --lib -p arb-bot` to apply 2 suggestions)
+   Compiling arb-bot v2.0.0 (/Users/sahil/Documents/Projects/poly-kalshi-arb)
+warning: unused import: `watch`
+  --> src/main.rs:19:27
+   |
+19 | use tokio::sync::{RwLock, watch};
+   |                           ^^^^^
+
+warning: variable does not need to be mutable
+  --> src/main.rs:75:13
+   |
+75 |         let mut s = GlobalState::new();
+   |             ----^
+   |             |
+   |             help: remove this `mut`
+   |
+   = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `t`
+   --> src/main.rs:242:24
+    |
+242 |                    let t = market.pair().map(|p| p.kalshi_market_ticker.to_string()).unwrap_or_else(|| "?".to_string());
+    |                        ^ help: if this is intentional, prefix it with an underscore: `_t`
+
+warning: constant `POLY_BTC15M_SERIES` is never used
+  --> src/config.rs:53:11
+   |
+53 | pub const POLY_BTC15M_SERIES: &str = "btc-up-or-down-15m";
+   |           ^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `CACHE_TTL_SECS` is never used
+  --> src/discovery.rs:37:7
+   |
+37 | const CACHE_TTL_SECS: u64 = 2 * 60 * 60;
+   |       ^^^^^^^^^^^^^^
+
+warning: methods `is_expired` and `age_secs` are never used
+  --> src/discovery.rs:74:8
+   |
+62 | impl DiscoveryCache {
+   | ------------------- methods in this implementation
+...
+74 |     fn is_expired(&self) -> bool {
+   |        ^^^^^^^^^^
+...
+79 |     fn age_secs(&self) -> u64 {
+   |        ^^^^^^^^
+
+warning: associated items `load_cache`, `discover_all`, and `discover_incremental` are never used
+   --> src/discovery.rs:122:14
+    |
+105 | impl DiscoveryClient {
+    | -------------------- associated items in this implementation
+...
+122 |     async fn load_cache() -> Option<DiscoveryCache> {
+    |              ^^^^^^^^^^
+...
+141 |     pub async fn discover_all(&self, leagues: &[&str]) -> DiscoveryResult {
+    |                  ^^^^^^^^^^^^
+...
+276 |     async fn discover_incremental(&self, leagues: &[&str], cache: DiscoveryCache) -> DiscoveryResult {
+    |              ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `process_kalshi_delta` is never used
+   --> src/kalshi.rs:684:4
+    |
+684 | fn process_kalshi_delta(market: &crate::types::AtomicMarketState, body: &KalshiWsMsgBody) {
+    |    ^^^^^^^^^^^^^^^^^^^^
+

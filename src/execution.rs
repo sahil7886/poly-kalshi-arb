@@ -109,7 +109,7 @@ impl ExecutionEngine {
         let market = self.state.get_by_id(market_id)
             .ok_or_else(|| anyhow!("Unknown market_id {}", market_id))?;
 
-        let pair = market.pair.as_ref()
+        let pair = market.pair()
             .ok_or_else(|| anyhow!("No pair for market_id {}", market_id))?;
 
         // Calculate profit
@@ -128,6 +128,14 @@ impl ExecutionEngine {
         // Calculate max contracts from size (min of both sides)
         let mut max_contracts = (req.yes_size.min(req.no_size) / 100) as i64;
 
+        // Log when liquidity significantly constrains order size
+        if max_contracts > 0 && max_contracts < 50 {
+            info!(
+                "[EXEC] 📊 Liquidity-limited: yes={}¢ no={}¢ → {}x",
+                req.yes_size, req.no_size, max_contracts
+            );
+        }
+
         // SAFETY: In test mode, cap at 10 contracts
         // Note: Polymarket has $1 minimum spend, so at 40¢ price, 1 contract = $0.40 (rejected!)
         // 10 contracts ensures we meet the minimum at any reasonable price
@@ -137,10 +145,10 @@ impl ExecutionEngine {
         }
 
         if max_contracts < 1 {
-            warn!(
-                "[EXEC] Liquidity fail: {:?} | yes_size={}¢ no_size={}¢",
-                req.arb_type, req.yes_size, req.no_size
-            );
+            // tracing::debug!(
+            //     "[EXEC] Liquidity fail: {:?} | yes_size={}¢ no_size={}¢",
+            //     req.arb_type, req.yes_size, req.no_size
+            // );
             self.release_in_flight(market_id);
             return Ok(ExecutionResult {
                 market_id,
@@ -188,7 +196,7 @@ impl ExecutionEngine {
         }
 
         // Execute both legs concurrently 
-        let result = self.execute_both_legs_async(&req, pair, max_contracts).await;
+        let result = self.execute_both_legs_async(&req, &pair, max_contracts).await;
 
         // Release in-flight after delay
         self.release_in_flight_delayed(market_id);
@@ -628,11 +636,13 @@ pub async fn run_execution_loop(
                     );
                 }
                 Ok(result) => {
-                    if result.error != Some("Already in-flight") {
+                    if result.error != Some("Already in-flight") && result.error != Some("Insufficient liquidity") {
                         warn!(
                             "[EXEC] ⚠️ market_id={}: {:?}",
                             result.market_id, result.error
                         );
+                    } else if result.error == Some("Insufficient liquidity") {
+                        tracing::debug!("[EXEC] ⚠️ market_id={}: Insufficient liquidity", result.market_id);
                     }
                 }
                 Err(e) => {

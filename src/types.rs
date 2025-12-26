@@ -2,8 +2,8 @@
 // Shared data structures
 
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicU16, Ordering};
+use std::sync::{Arc, RwLock};
 use rustc_hash::FxHashMap;
 
 // === Market Types ===
@@ -15,7 +15,8 @@ pub enum MarketType {
     Spread,
     Total,
     Btts,
-    Mention,  // "Say" markets - what will X say at event Y
+    Mention,   // "Say" markets - what will X say at event Y
+    Btc15m,    // BTC 15-minute Up/Down recurring markets
 }
 
 impl std::fmt::Display for MarketType {
@@ -26,6 +27,7 @@ impl std::fmt::Display for MarketType {
             MarketType::Total => write!(f, "total"),
             MarketType::Btts => write!(f, "btts"),
             MarketType::Mention => write!(f, "mention"),
+            MarketType::Btc15m => write!(f, "btc15m"),
         }
     }
 }
@@ -137,8 +139,8 @@ impl Default for AtomicOrderbook {
 pub struct AtomicMarketState {
     pub kalshi: AtomicOrderbook,
     pub poly: AtomicOrderbook,
-    /// Market pair data (immutable after discovery)
-    pub pair: Option<Arc<MarketPair>>,
+    /// Market pair data (RwLock for thread-safe dynamic updates)
+    pair_lock: RwLock<Option<Arc<MarketPair>>>,
     /// Market ID for lookups
     pub market_id: u16,
 }
@@ -148,9 +150,20 @@ impl AtomicMarketState {
         Self {
             kalshi: AtomicOrderbook::new(),
             poly: AtomicOrderbook::new(),
-            pair: None,
+            pair_lock: RwLock::new(None),
             market_id,
         }
+    }
+    
+    /// Get the market pair (read access)
+    #[inline]
+    pub fn pair(&self) -> Option<Arc<MarketPair>> {
+        self.pair_lock.read().ok()?.clone()
+    }
+    
+    /// Set the market pair (write access)
+    pub fn set_pair(&self, pair: MarketPair) {
+        *self.pair_lock.write().unwrap() = Some(Arc::new(pair));
     }
 
     #[inline(always)]
@@ -306,17 +319,17 @@ pub struct GlobalState {
     /// Market states indexed by market_id
     pub markets: Vec<AtomicMarketState>,
 
-    /// Next available market_id
-    next_market_id: u16,
+    /// Next available market_id (atomic for thread-safe increment)
+    next_market_id: AtomicU16,
 
-    /// O(1) lookup: pre-hashed Kalshi ticker → market_id
-    pub kalshi_to_id: FxHashMap<u64, u16>,
+    /// O(1) lookup: pre-hashed Kalshi ticker → market_id (RwLock for dynamic updates)
+    pub kalshi_to_id: RwLock<FxHashMap<u64, u16>>,
 
-    /// O(1) lookup: pre-hashed Poly YES token → market_id
-    pub poly_yes_to_id: FxHashMap<u64, u16>,
+    /// O(1) lookup: pre-hashed Poly YES token → market_id (RwLock for dynamic updates)
+    pub poly_yes_to_id: RwLock<FxHashMap<u64, u16>>,
 
-    /// O(1) lookup: pre-hashed Poly NO token → market_id
-    pub poly_no_to_id: FxHashMap<u64, u16>,
+    /// O(1) lookup: pre-hashed Poly NO token → market_id (RwLock for dynamic updates)
+    pub poly_no_to_id: RwLock<FxHashMap<u64, u16>>,
 }
 
 impl GlobalState {
@@ -328,34 +341,33 @@ impl GlobalState {
 
         Self {
             markets,
-            next_market_id: 0,
-            kalshi_to_id: FxHashMap::default(),
-            poly_yes_to_id: FxHashMap::default(),
-            poly_no_to_id: FxHashMap::default(),
+            next_market_id: AtomicU16::new(0),
+            kalshi_to_id: RwLock::new(FxHashMap::default()),
+            poly_yes_to_id: RwLock::new(FxHashMap::default()),
+            poly_no_to_id: RwLock::new(FxHashMap::default()),
         }
     }
 
-    /// Add a market pair, returns market_id
-    pub fn add_pair(&mut self, pair: MarketPair) -> Option<u16> {
-        if self.next_market_id as usize >= MAX_MARKETS {
+    /// Add a market pair, returns market_id (requires &mut self for initialization)
+    pub fn add_pair(&self, pair: MarketPair) -> Option<u16> {
+        // Atomically get next market_id
+        let market_id = self.next_market_id.fetch_add(1, Ordering::SeqCst);
+        if market_id as usize >= MAX_MARKETS {
             return None;
         }
-
-        let market_id = self.next_market_id;
-        self.next_market_id += 1;
 
         // Pre-compute hashes
         let kalshi_hash = fxhash_str(&pair.kalshi_market_ticker);
         let poly_yes_hash = fxhash_str(&pair.poly_yes_token);
         let poly_no_hash = fxhash_str(&pair.poly_no_token);
 
-        // Update lookup maps
-        self.kalshi_to_id.insert(kalshi_hash, market_id);
-        self.poly_yes_to_id.insert(poly_yes_hash, market_id);
-        self.poly_no_to_id.insert(poly_no_hash, market_id);
+        // Update lookup maps (write locks)
+        self.kalshi_to_id.write().unwrap().insert(kalshi_hash, market_id);
+        self.poly_yes_to_id.write().unwrap().insert(poly_yes_hash, market_id);
+        self.poly_no_to_id.write().unwrap().insert(poly_no_hash, market_id);
 
-        // Store pair
-        self.markets[market_id as usize].pair = Some(Arc::new(pair));
+        // Store pair using thread-safe set_pair
+        self.markets[market_id as usize].set_pair(pair);
 
         Some(market_id)
     }
@@ -364,7 +376,8 @@ impl GlobalState {
     #[inline(always)]
     #[allow(dead_code)]
     pub fn get_by_kalshi_hash(&self, hash: u64) -> Option<&AtomicMarketState> {
-        let id = *self.kalshi_to_id.get(&hash)?;
+        let guard = self.kalshi_to_id.read().ok()?;
+        let id = *guard.get(&hash)?;
         Some(&self.markets[id as usize])
     }
 
@@ -372,7 +385,8 @@ impl GlobalState {
     #[inline(always)]
     #[allow(dead_code)]
     pub fn get_by_poly_yes_hash(&self, hash: u64) -> Option<&AtomicMarketState> {
-        let id = *self.poly_yes_to_id.get(&hash)?;
+        let guard = self.poly_yes_to_id.read().ok()?;
+        let id = *guard.get(&hash)?;
         Some(&self.markets[id as usize])
     }
 
@@ -380,7 +394,8 @@ impl GlobalState {
     #[inline(always)]
     #[allow(dead_code)]
     pub fn get_by_poly_no_hash(&self, hash: u64) -> Option<&AtomicMarketState> {
-        let id = *self.poly_no_to_id.get(&hash)?;
+        let guard = self.poly_no_to_id.read().ok()?;
+        let id = *guard.get(&hash)?;
         Some(&self.markets[id as usize])
     }
 
@@ -388,21 +403,21 @@ impl GlobalState {
     #[inline(always)]
     #[allow(dead_code)]
     pub fn id_by_poly_yes_hash(&self, hash: u64) -> Option<u16> {
-        self.poly_yes_to_id.get(&hash).copied()
+        self.poly_yes_to_id.read().ok()?.get(&hash).copied()
     }
 
     /// Get market_id by Poly NO token hash
     #[inline(always)]
     #[allow(dead_code)]
     pub fn id_by_poly_no_hash(&self, hash: u64) -> Option<u16> {
-        self.poly_no_to_id.get(&hash).copied()
+        self.poly_no_to_id.read().ok()?.get(&hash).copied()
     }
 
     /// Get market_id by Kalshi ticker hash
     #[inline(always)]
     #[allow(dead_code)]
     pub fn id_by_kalshi_hash(&self, hash: u64) -> Option<u16> {
-        self.kalshi_to_id.get(&hash).copied()
+        self.kalshi_to_id.read().ok()?.get(&hash).copied()
     }
 
     /// Get market by ID
@@ -416,7 +431,7 @@ impl GlobalState {
     }
 
     pub fn market_count(&self) -> usize {
-        self.next_market_id as usize
+        self.next_market_id.load(Ordering::Relaxed) as usize
     }
 }
 
@@ -843,17 +858,17 @@ mod tests {
 
         // Test get_by_id
         let market = state.get_by_id(id).expect("Should find by id");
-        assert!(market.pair.is_some());
+        assert!(market.pair().is_some());
 
         // Test get_by_kalshi_hash
         let market = state.get_by_kalshi_hash(fxhash_str(&kalshi_ticker))
             .expect("Should find by Kalshi hash");
-        assert!(market.pair.is_some());
+        assert!(market.pair().is_some());
 
         // Test get_by_poly_yes_hash
         let market = state.get_by_poly_yes_hash(fxhash_str(&poly_yes))
             .expect("Should find by Poly YES hash");
-        assert!(market.pair.is_some());
+        assert!(market.pair().is_some());
 
         // Test id lookups
         assert_eq!(state.id_by_kalshi_hash(fxhash_str(&kalshi_ticker)), Some(id));
@@ -1205,12 +1220,20 @@ pub struct KalshiMarketsResponse {
 pub struct KalshiMarket {
     pub ticker: String,
     pub title: String,
+    #[serde(default)]
+    pub event_ticker: String,
+    #[serde(default)]
+    pub status: Option<String>,
     pub yes_ask: Option<i64>,
     pub yes_bid: Option<i64>,
     pub no_ask: Option<i64>,
     pub no_bid: Option<i64>,
     #[serde(default)]
     pub yes_sub_title: Option<String>,
+    #[serde(default)]
+    pub no_sub_title: Option<String>,
+    pub open_time: chrono::DateTime<chrono::Utc>,
+    pub close_time: chrono::DateTime<chrono::Utc>,
     #[serde(default)]
     pub floor_strike: Option<f64>,
     pub volume: Option<i64>,
