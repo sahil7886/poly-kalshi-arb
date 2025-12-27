@@ -19,6 +19,7 @@ use anyhow::{Context, Result};
 use std::sync::Arc;
 use tokio::sync::{RwLock, watch};
 use tracing::{error, info, warn};
+use ethers::types::U256;
 
 use cache::TeamCache;
 use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
@@ -44,6 +45,7 @@ async fn run_session(
     kalshi_ws_config: &KalshiConfig,
     dry_run: bool,
     full_duration_secs: u64,
+    funder: String,
 ) -> Result<()> {
     // Run discovery (always force refresh for new sessions)
     info!("🔍 Discovering markets (forced refresh)...");
@@ -141,7 +143,7 @@ async fn run_session(
     // Start redemption background task (hourly)
     let redemption_handle = if !dry_run {
         let rpc_url = std::env::var("POLYGON_RPC_URL").unwrap_or_else(|_| "https://polygon-rpc.com".to_string());
-        Some(tokio::spawn(crate::redemption::run_hourly_loop(poly_async.clone(), rpc_url)))
+        Some(tokio::spawn(crate::redemption::run_hourly_loop(poly_async.clone(), rpc_url, funder)))
     } else {
         None
     };
@@ -336,6 +338,9 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    // Load .env file FIRST so all config values are available
+    dotenvy::dotenv().ok();
+
     info!("🎯 Arb Bot v2.0 - Supervisor Mode");
     info!("   Threshold: <{:.1}¢ for {:.1}% profit",
           ARB_THRESHOLD * 100.0, (1.0 - ARB_THRESHOLD) * 100.0);
@@ -353,8 +358,7 @@ async fn main() -> Result<()> {
     let kalshi_config = KalshiConfig::from_env()?;
     info!("[KALSHI] API key loaded");
 
-    // Load Polymarket credentials
-    dotenvy::dotenv().ok();
+    // Load Polymarket credentials (dotenv already called at startup)
     let poly_private_key = std::env::var("POLY_PRIVATE_KEY")
         .context("POLY_PRIVATE_KEY not set")?;
     let poly_funder = std::env::var("POLY_FUNDER")
@@ -378,7 +382,9 @@ async fn main() -> Result<()> {
         Err(e) => warn!("[POLYMARKET] Could not load neg_risk cache: {}", e),
     }
 
-    info!("[POLYMARKET] Client ready for {}", &poly_funder[..10]);
+    info!("[POLYMARKET] Client ready");
+    info!("   Funder: {}", &poly_funder);
+    info!("   Signer (needs MATIC): {:?}", poly_async.signer_address());
 
     // Load team cache
     let team_cache = TeamCache::load();
@@ -395,6 +401,24 @@ async fn main() -> Result<()> {
 
     // Initial delay to let things settle? No.
 
+    // Balance Checks
+    if !dry_run {
+        info!("💰 Checking balances...");
+        match kalshi_api.get_balance().await {
+            Ok(bal) => info!("   Kalshi Balance: ${:.2}", bal as f64 / 100.0),
+            Err(e) => warn!("   ⚠️ Failed to fetch Kalshi balance: {}", e),
+        }
+
+        let rpc_url = std::env::var("POLYGON_RPC_URL").unwrap_or_else(|_| "https://polygon-rpc.com".to_string());
+        match poly_async.get_usdc_balance(&rpc_url).await {
+            Ok(bal) => {
+                 let bal_f64 = bal.as_u128() as f64 / 1_000_000.0; // USDC has 6 decimals
+                 info!("   Polymarket USDC: ${:.2}", bal_f64);
+            }
+            Err(e) => warn!("   ⚠️ Failed to fetch Polymarket USDC balance: {}", e),
+        }
+    }
+
     // SUPERVISOR LOOP
     // Run for 4 hours (fetching ~20 markets covers 5 hours, so 4 hours is safe)
     let session_duration = 14400; 
@@ -408,7 +432,8 @@ async fn main() -> Result<()> {
             discovery.clone(),
             &kalshi_config,
             dry_run,
-            session_duration
+            session_duration,
+            poly_funder.clone(),
         ).await {
             Ok(_) => {
                 info!("✅ Session completed normally. Restarting...");

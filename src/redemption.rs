@@ -1,5 +1,6 @@
 // src/redemption.rs
 // Polymarket Auto-Redemption Module
+// Uses Polymarket Data API to find redeemable positions
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,83 +14,86 @@ use crate::polymarket_clob::SharedAsyncClient;
 // Polymarket Mainnet Addresses
 const CTF_CONTRACT: &str = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045";
 const USDC_ADDR: &str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
-const GAMMA_API_BASE: &str = "https://gamma-api.polymarket.com";
+const POLYMARKET_DATA_API: &str = "https://data-api.polymarket.com";
 
 // ABI for the redeemPositions function
 const CTF_ABI: &str = r#"[
     {"inputs":[{"internalType":"contract IERC20","name":"collateralToken","type":"address"},{"internalType":"bytes32","name":"parentCollectionId","type":"bytes32"},{"internalType":"bytes32","name":"conditionId","type":"bytes32"},{"internalType":"uint256[]","name":"indexSets","type":"uint256[]"}],"name":"redeemPositions","outputs":[],"stateMutability":"nonpayable","type":"function"}
 ]"#;
 
+/// Position from Polymarket Data API /positions endpoint
 #[derive(Debug, Deserialize)]
-struct GammaMarket {
+struct RedeemablePosition {
     #[serde(rename = "conditionId")]
     condition_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct GammaEvent {
-    markets: Vec<GammaMarket>,
+    #[allow(dead_code)]
+    asset: String, // token ID
+    #[allow(dead_code)]
+    size: f64,
 }
 
 pub struct RedemptionManager {
     provider: Arc<Provider<Http>>,
     wallet: LocalWallet,
     contract: Contract<Provider<Http>>,
+    funder: String, // POLY_FUNDER - the wallet that owns positions
+    http: reqwest::Client,
 }
 
 impl RedemptionManager {
-    pub fn new(poly_client: Arc<SharedAsyncClient>, rpc_url: String) -> Result<Self> {
+    pub fn new(poly_client: Arc<SharedAsyncClient>, rpc_url: String, funder: String) -> Result<Self> {
         let provider = Provider::<Http>::try_from(&rpc_url)?;
         let provider = Arc::new(provider);
         
-        // Use the same wallet as the CLOB client
+        // Use the same wallet as the CLOB client (signer)
         let wallet = poly_client.inner_wallet().clone();
         
         let abi: Abi = serde_json::from_str(CTF_ABI)?;
         let address: Address = CTF_CONTRACT.parse()?;
         let contract = Contract::new(address, abi, provider.clone());
 
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()?;
+
         Ok(Self {
             provider,
             wallet,
             contract,
+            funder,
+            http,
         })
     }
 
-    /// Fetch condition IDs from recently closed Polymarket events
-    async fn fetch_recent_condition_ids(&self) -> Result<Vec<String>> {
-        let url = format!("{}/events?closed=true&limit=20", GAMMA_API_BASE);
-        let resp = reqwest::get(&url).await?;
+    /// Fetch redeemable positions from Polymarket Data API
+    /// Only returns positions where user has a winning balance ready to redeem
+    async fn fetch_redeemable_positions(&self) -> Result<Vec<RedeemablePosition>> {
+        let url = format!(
+            "{}/positions?user={}&redeemable=true",
+            POLYMARKET_DATA_API, self.funder
+        );
+        
+        let resp = self.http.get(&url).send().await?;
         if !resp.status().is_success() {
-            return Err(anyhow!("Failed to fetch closed events: {}", resp.status()));
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("Failed to fetch positions: {} - {}", status, body));
         }
 
-        let events: Vec<GammaEvent> = resp.json().await?;
-        let mut ids = Vec::new();
-        for event in events {
-            for market in event.markets {
-                if !market.condition_id.is_empty() && market.condition_id != "0x0000000000000000000000000000000000000000000000000000000000000000" {
-                    ids.push(market.condition_id);
-                }
-            }
-        }
-        
-        // De-duplicate
-        ids.sort();
-        ids.dedup();
-        
-        Ok(ids)
+        let positions: Vec<RedeemablePosition> = resp.json().await?;
+        Ok(positions)
     }
 
-    /// Redeem positions for a list of condition IDs
+    /// Redeem all redeemable positions
     pub async fn redeem_all(&self) -> Result<()> {
-        let condition_ids = self.fetch_recent_condition_ids().await?;
-        if condition_ids.is_empty() {
-            info!("[REDEEM] No recently closed markets found to check.");
+        let positions = self.fetch_redeemable_positions().await?;
+        
+        if positions.is_empty() {
+            info!("[REDEEM] No redeemable positions found.");
             return Ok(());
         }
 
-        info!("[REDEEM] Checking {} recent condition IDs for winnings...", condition_ids.len());
+        info!("[REDEEM] Found {} redeemable positions!", positions.len());
 
         let collateral_token: Address = USDC_ADDR.parse()?;
         let parent_collection_id = H256::zero();
@@ -99,37 +103,25 @@ impl RedemptionManager {
         let client = SignerMiddleware::new(self.provider.clone(), self.wallet.clone());
         let client = Arc::new(client);
 
-        for cid in condition_ids {
-            let condition_id: H256 = match cid.parse() {
+        for position in positions {
+            let condition_id: H256 = match position.condition_id.parse() {
                 Ok(h) => h,
-                Err(_) => continue,
+                Err(_) => {
+                    warn!("[REDEEM] Invalid conditionId: {}", position.condition_id);
+                    continue;
+                }
             };
 
-            // We don't check balance first because it's multiple ERC-1155 IDs. 
-            // Just attempt redemption. If zero balance, it might revert or do nothing.
-            // To be efficient, we could query balance of tokenID = keccak256(collateral, conditionId, indexSet).
-            // But for "make it happen", simple is better.
-            
-            // Note: redeemPositions only works if the market is resolved AND you have a balance.
-            // If we attempt it on a market where we have no balance, it's a waste of gas.
-            // In a low-priority implementation, we'll just try if it's cheap, or better:
-            // Check if we *ever* traded this market. 
-            // Since we don't have persistent state, we'll just try the last 20 events.
-            
-            // To avoid wasting gas on zero positions, let's at least check if we have ANY balance on one of the outcomes.
-            // This requires computing the token IDs. 
-            
             match self.try_redeem(&client, collateral_token, parent_collection_id, condition_id, &index_sets).await {
-                Ok(true) => info!("[REDEEM] ✅ Redeemed winnings for {}", cid),
-                Ok(false) => {}, // No position or already redeemed
+                Ok(true) => info!("[REDEEM] ✅ Redeemed: {}", &position.condition_id[..20]),
+                Ok(false) => warn!("[REDEEM] ⚠️ Redemption returned false for {}", &position.condition_id[..20]),
                 Err(e) => {
-                    if e.to_string().contains("insufficient funds") {
-                        error!("[REDEEM] ❌ FAILED: Insufficient MATIC for gas. Please fund {}", self.wallet.address());
-                    } else if e.to_string().contains("execution reverted") {
-                        // Likely no balance or not resolved yet
-                        // info!("[REDEEM] Skipping {}: Not redeemable (reverted)", cid);
+                    let err_str = e.to_string();
+                    if err_str.contains("insufficient funds") || err_str.contains("Insufficient MATIC") {
+                        error!("[REDEEM] ❌ Insufficient MATIC for gas. Fund: {}", self.wallet.address());
+                        break; // No point continuing without gas
                     } else {
-                        warn!("[REDEEM] ⚠️ Error redeeming {}: {}", cid, e);
+                        warn!("[REDEEM] ⚠️ Error for {}: {}", &position.condition_id[..20], e);
                     }
                 }
             }
@@ -140,7 +132,7 @@ impl RedemptionManager {
 
     async fn try_redeem(
         &self, 
-        client: &SignerMiddleware<Arc<Provider<Http>>, LocalWallet>,
+        _client: &SignerMiddleware<Arc<Provider<Http>>, LocalWallet>,
         collateral_token: Address,
         parent_collection_id: H256,
         condition_id: H256,
@@ -151,11 +143,11 @@ impl RedemptionManager {
             .method::<_, ()>("redeemPositions", (collateral_token, parent_collection_id, condition_id, index_sets.to_vec()))?
             .from(self.wallet.address());
 
-        // We can use call() to see if it would revert without sending gas
+        // Use call() to check if it would succeed without sending gas
         match tx.call().await {
             Ok(_) => {
-                // Not reverted! Let's send it.
-                info!("[REDEEM] 🚀 Sending redemption transaction for {}...", condition_id);
+                // Not reverted - proceed with redemption
+                info!("[REDEEM] 🚀 Sending redemption tx for {}...", condition_id);
                 let pending_tx = tx.send().await?;
                 let receipt = pending_tx.await?;
                 if let Some(r) = receipt {
@@ -164,8 +156,9 @@ impl RedemptionManager {
                 }
                 Ok(false)
             }
-            Err(_) => {
-                // Reverted, likely zero balance or not resolved
+            Err(e) => {
+                // Reverted - this shouldn't happen if API said it's redeemable
+                warn!("[REDEEM] ⚠️ Call reverted (unexpected): {}", e);
                 Ok(false)
             }
         }
@@ -173,23 +166,27 @@ impl RedemptionManager {
 }
 
 /// Main hourly loop for auto-redemption
-pub async fn run_hourly_loop(poly_client: Arc<SharedAsyncClient>, rpc_url: String) {
-    info!("[REDEEM] Starting auto-redemption background task (Interval: 1 hour)");
+pub async fn run_hourly_loop(poly_client: Arc<SharedAsyncClient>, rpc_url: String, funder: String) {
+    info!("[REDEEM] Auto-redemption started (checks every 1 hour)");
     
-    let manager = match RedemptionManager::new(poly_client, rpc_url) {
+    let manager = match RedemptionManager::new(poly_client, rpc_url, funder) {
         Ok(m) => m,
         Err(e) => {
-            error!("[REDEEM] ❌ Failed to initialize RedemptionManager: {}", e);
+            error!("[REDEEM] ❌ Failed to initialize: {}", e);
             return;
         }
     };
+
+    // Wait 1 hour before first check (assume everything redeemed at startup)
+    info!("[REDEEM] First check in 1 hour...");
+    tokio::time::sleep(Duration::from_secs(3600)).await;
 
     loop {
         if let Err(e) = manager.redeem_all().await {
             error!("[REDEEM] Loop error: {}", e);
         }
         
-        info!("[REDEEM] Sleeping for 1 hour...");
+        info!("[REDEEM] Next check in 1 hour...");
         tokio::time::sleep(Duration::from_secs(3600)).await;
     }
 }

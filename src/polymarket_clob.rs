@@ -10,6 +10,8 @@ use ethers::signers::{LocalWallet, Signer};
 use ethers::types::H256;
 use ethers::types::transaction::eip712::{Eip712, TypedData};
 use ethers::types::U256;
+use ethers::prelude::*;
+use ethers::abi::Abi;
 use hmac::{Hmac, Mac};
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
@@ -21,6 +23,11 @@ use std::sync::Arc;
 const USER_AGENT: &str = "py_clob_client";
 const MSG_TO_SIGN: &str = "This message attests that I control the given wallet";
 const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
+
+// USDC on Polygon
+const USDC_ADDR: &str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
+const ERC20_ABI: &str = r#"[{"constant":true,"inputs":[{"name":"_owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],"payable":false,"stateMutability":"view","type":"function"}]"#;
+
 
 // ============================================================================
 // PRE-COMPUTED EIP712 CONSTANTS
@@ -544,6 +551,18 @@ impl PolymarketAsyncClient {
     pub fn wallet_address(&self) -> &str {
         &self.wallet_address_str
     }
+
+    /// Get USDC balance via RPC
+    pub async fn get_usdc_balance(&self, rpc_url: &str) -> Result<U256> {
+        let provider = Provider::<Http>::try_from(rpc_url)?;
+        let provider = Arc::new(provider);
+        let address: Address = self.wallet.address();
+        let usdc: Address = USDC_ADDR.parse()?;
+        let abi: Abi = serde_json::from_str(ERC20_ABI)?;
+        let contract = Contract::new(usdc, abi, provider);
+        let balance: U256 = contract.method::<_, U256>("balanceOf", address)?.call().await?;
+        Ok(balance)
+    }
 }
 
 /// Shared async client wrapper for use in execution engine
@@ -567,6 +586,16 @@ impl SharedAsyncClient {
 
     pub fn inner_wallet(&self) -> &LocalWallet {
         self.inner.wallet()
+    }
+
+    /// Get the signer wallet address (this address needs MATIC for gas)
+    pub fn signer_address(&self) -> ethers::types::Address {
+        self.inner.wallet().address()
+    }
+    
+    /// Get USDC balance via RPC
+    pub async fn get_usdc_balance(&self, rpc_url: &str) -> Result<U256> {
+        self.inner.get_usdc_balance(rpc_url).await
     }
 
     /// Load neg_risk cache from JSON file (output of build_sports_cache.py)
@@ -629,15 +658,41 @@ impl SharedAsyncClient {
         let resp_json: serde_json::Value = resp.json().await?;
         let order_id = resp_json["orderID"].as_str().unwrap_or("unknown").to_string();
 
-        // Query fill status
-        let order_info = self.inner.get_order_async(&order_id, &self.creds).await?;
-        let filled_size: f64 = order_info.size_matched.parse().unwrap_or(0.0);
-        let order_price: f64 = order_info.price.parse().unwrap_or(price);
-
-        tracing::debug!(
-            "[POLY-ASYNC] FAK {} {}: status={}, filled={:.2}/{:.2}, price={:.4}",
-            side, order_id, order_info.status, filled_size, size, order_price
-        );
+        // Poll for fill status - PM matching engine is async, fills can take 1-3 seconds
+        // We poll up to 3 times with 500ms delay to catch the fill
+        let mut filled_size: f64 = 0.0;
+        let mut order_price: f64 = price;
+        
+        for attempt in 0..3 {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            
+            match self.inner.get_order_async(&order_id, &self.creds).await {
+                Ok(order_info) => {
+                    filled_size = order_info.size_matched.parse().unwrap_or(0.0);
+                    order_price = order_info.price.parse().unwrap_or(price);
+                    
+                    tracing::debug!(
+                        "[POLY-ASYNC] FAK {} {} (attempt {}): status={}, filled={:.2}/{:.2}, price={:.4}",
+                        side, order_id, attempt + 1, order_info.status, filled_size, size, order_price
+                    );
+                    
+                    // If we got fills, we're done
+                    if filled_size > 0.0 {
+                        break;
+                    }
+                    
+                    // If order is fully cancelled/dead with 0 fills, stop polling
+                    if order_info.status == "CANCELLED" || order_info.status == "DEAD" {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("[POLY-ASYNC] Failed to get order status (attempt {}): {}", attempt + 1, e);
+                }
+            }
+        }
 
         Ok(PolyFillAsync {
             order_id,

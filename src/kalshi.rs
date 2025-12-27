@@ -130,6 +130,11 @@ pub struct KalshiOrderDetails {
     pub maker_fill_cost: Option<i64>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct KalshiBalanceResponse {
+    pub balance: i64,
+}
+
 #[allow(dead_code)]
 impl KalshiOrderDetails {
     /// Total filled contracts
@@ -359,6 +364,13 @@ impl KalshiApiClient {
         let data: T = resp.json().await?;
         Ok(data)
     }
+
+    /// Get account balance in cents
+    pub async fn get_balance(&self) -> Result<i64> {
+        let path = "/portfolio/balance";
+        let resp: KalshiBalanceResponse = self.get(path).await?;
+        Ok(resp.balance)
+    }
     
     /// Create an order on Kalshi
     pub async fn create_order(&self, order: &KalshiOrderRequest<'_>) -> Result<KalshiOrderResponse> {
@@ -387,10 +399,11 @@ impl KalshiApiClient {
             count,
             Cow::Borrowed(&order_id)
         );
-        debug!("[KALSHI] IOC {} {} @{}¢ x{}", side, ticker, price_cents, count);
+        info!("[KALSHI] IOC BUY {} {} limit={}¢ x{}", side, ticker, price_cents, count);
 
         let resp = self.create_order(&order).await?;
-        debug!("[KALSHI] {} filled={}", resp.order.status, resp.order.filled_count());
+        info!("[KALSHI] {} filled={} cost={}¢", resp.order.status, resp.order.filled_count(), 
+              resp.order.taker_fill_cost.unwrap_or(0) + resp.order.maker_fill_cost.unwrap_or(0));
         Ok(resp)
     }
 

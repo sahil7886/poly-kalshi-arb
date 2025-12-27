@@ -499,7 +499,7 @@ impl ExecutionEngine {
                 } else {
                     (&poly_no_token, "no", no_price)
                 };
-                let close_price = cents_to_price(((price as i16).saturating_sub(10).max(1)) as u8);
+                let close_price = cents_to_price(1); // Market sell at best available
 
                 info!("[EXEC] 🔄 Waiting 2s for Poly settlement before auto-close ({} {} contracts)", excess, side);
                 tokio::time::sleep(Duration::from_secs(2)).await;
@@ -516,7 +516,7 @@ impl ExecutionEngine {
                 } else {
                     ("no", no_price as i64)
                 };
-                let close_price = price.saturating_sub(10).max(1);
+                let close_price = 1; // Market sell at best available
 
                 match kalshi.sell_ioc(&kalshi_ticker, side, close_price, excess).await {
                     Ok(resp) => {
@@ -530,7 +530,7 @@ impl ExecutionEngine {
             ArbType::PolyYesKalshiNo => {
                 if yes_filled > no_filled {
                     // Poly YES excess
-                    let close_price = cents_to_price(((yes_price as i16).saturating_sub(10).max(1)) as u8);
+                    let close_price = cents_to_price(1); // Market sell at best available
                     info!("[EXEC] 🔄 Waiting 2s for Poly settlement before auto-close ({} yes contracts)", excess);
                     tokio::time::sleep(Duration::from_secs(2)).await;
 
@@ -540,7 +540,7 @@ impl ExecutionEngine {
                     }
                 } else {
                     // Kalshi NO excess
-                    let close_price = (no_price as i64).saturating_sub(10).max(1);
+                    let close_price = 1; // Market sell at best available
                     match kalshi.sell_ioc(&kalshi_ticker, "no", close_price, excess).await {
                         Ok(resp) => {
                             let proceeds = resp.order.taker_fill_cost.unwrap_or(0) + resp.order.maker_fill_cost.unwrap_or(0);
@@ -554,7 +554,7 @@ impl ExecutionEngine {
             ArbType::KalshiYesPolyNo => {
                 if yes_filled > no_filled {
                     // Kalshi YES excess
-                    let close_price = (yes_price as i64).saturating_sub(10).max(1);
+                    let close_price = 1; // Market sell at best available
                     match kalshi.sell_ioc(&kalshi_ticker, "yes", close_price, excess).await {
                         Ok(resp) => {
                             let proceeds = resp.order.taker_fill_cost.unwrap_or(0) + resp.order.maker_fill_cost.unwrap_or(0);
@@ -564,7 +564,7 @@ impl ExecutionEngine {
                     }
                 } else {
                     // Poly NO excess
-                    let close_price = cents_to_price(((no_price as i16).saturating_sub(10).max(1)) as u8);
+                    let close_price = cents_to_price(1); // Market sell at best available
                     info!("[EXEC] 🔄 Waiting 2s for Poly settlement before auto-close ({} no contracts)", excess);
                     tokio::time::sleep(Duration::from_secs(2)).await;
 
