@@ -149,6 +149,7 @@ impl ExecutionEngine {
         };
 
         // Check $1 minimum BEFORE any capping
+        // This happens frequently for low-priced markets, so don't spam logs
         if max_contracts < min_contracts_for_poly {
             self.release_in_flight(market_id);
             return Ok(ExecutionResult {
@@ -156,7 +157,7 @@ impl ExecutionEngine {
                 success: false,
                 profit_cents: 0,
                 latency_ns: self.clock.now_ns() - req.detected_ns,
-                error: Some("Below $1 minimum"),
+                error: None, // Silent skip - not an error, just below minimum
             });
         }
 
