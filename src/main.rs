@@ -12,6 +12,7 @@ mod kalshi;
 mod polymarket;
 mod polymarket_clob;
 mod position_tracker;
+mod redemption;
 mod types;
 
 use anyhow::{Context, Result};
@@ -136,6 +137,14 @@ async fn run_session(
             tokio::time::sleep(tokio::time::Duration::from_secs(WS_RECONNECT_DELAY_SECS)).await;
         }
     });
+
+    // Start redemption background task (hourly)
+    let redemption_handle = if !dry_run {
+        let rpc_url = std::env::var("POLYGON_RPC_URL").unwrap_or_else(|_| "https://polygon-rpc.com".to_string());
+        Some(tokio::spawn(crate::redemption::run_hourly_loop(poly_async.clone(), rpc_url)))
+    } else {
+        None
+    };
 
     // Market Manager task - runs discovery every 5 minutes to add new markets
     let manager_state = state.clone();
@@ -299,6 +308,9 @@ async fn run_session(
     heartbeat_handle.abort();
     manager_handle.abort();
     pos_writer_handle.abort();
+    if let Some(h) = redemption_handle {
+        h.abort();
+    }
     
     // exec_handle is already finished or we don't care about aborting it if we timed out (it will be aborted when we drop the channel? No.)
     // We should abort it to be safe.

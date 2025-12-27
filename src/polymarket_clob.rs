@@ -531,11 +531,6 @@ impl PolymarketAsyncClient {
     }
 
     #[allow(dead_code)]
-    pub fn wallet_address(&self) -> &str {
-        &self.wallet_address_str
-    }
-
-    #[allow(dead_code)]
     pub fn funder(&self) -> &str {
         &self.funder
     }
@@ -543,6 +538,11 @@ impl PolymarketAsyncClient {
     #[allow(dead_code)]
     pub fn wallet(&self) -> &LocalWallet {
         &self.wallet
+    }
+
+    #[allow(dead_code)]
+    pub fn wallet_address(&self) -> &str {
+        &self.wallet_address_str
     }
 }
 
@@ -563,6 +563,10 @@ impl SharedAsyncClient {
             chain_id,
             neg_risk_cache: std::sync::RwLock::new(HashMap::new()),
         }
+    }
+
+    pub fn inner_wallet(&self) -> &LocalWallet {
+        self.inner.wallet()
     }
 
     /// Load neg_risk cache from JSON file (output of build_sports_cache.py)
