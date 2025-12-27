@@ -556,7 +556,11 @@ impl PolymarketAsyncClient {
     pub async fn get_usdc_balance(&self, rpc_url: &str) -> Result<U256> {
         let provider = Provider::<Http>::try_from(rpc_url)?;
         let provider = Arc::new(provider);
-        let address: Address = self.wallet.address();
+        
+        // Use the funder (proxy) address for balance checks, as that's where USDC is held
+        let address: Address = self.funder.parse()
+            .map_err(|_| anyhow!("Invalid funder address: {}", self.funder))?;
+            
         let usdc: Address = USDC_ADDR.parse()?;
         let abi: Abi = serde_json::from_str(ERC20_ABI)?;
         let contract = Contract::new(usdc, abi, provider);
