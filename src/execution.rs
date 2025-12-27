@@ -273,6 +273,7 @@ impl ExecutionEngine {
                         ArbType::KalshiOnly => ("kalshi", "yes", "kalshi", "no"),
                     };
 
+                    // Log matched fills (both sides)
                     self.position_channel.record_fill(FillRecord::new(
                         &pair.pair_id, &pair.description, platform1, side1,
                         matched as f64, yes_cost as f64 / 100.0 / yes_filled.max(1) as f64,
@@ -283,6 +284,29 @@ impl ExecutionEngine {
                         matched as f64, no_cost as f64 / 100.0 / no_filled.max(1) as f64,
                         0.0, &no_order_id,
                     ));
+                } else {
+                    // Log partial/unmatched fills for debugging
+                    let (platform1, side1, platform2, side2) = match req.arb_type {
+                        ArbType::PolyYesKalshiNo => ("polymarket", "yes", "kalshi", "no"),
+                        ArbType::KalshiYesPolyNo => ("kalshi", "yes", "polymarket", "no"),
+                        ArbType::PolyOnly => ("polymarket", "yes", "polymarket", "no"),
+                        ArbType::KalshiOnly => ("kalshi", "yes", "kalshi", "no"),
+                    };
+
+                    if yes_filled > 0 {
+                        self.position_channel.record_fill(FillRecord::new(
+                            &pair.pair_id, &pair.description, platform1, side1,
+                            yes_filled as f64, yes_cost as f64 / 100.0 / yes_filled as f64,
+                            0.0, &yes_order_id,
+                        ));
+                    }
+                    if no_filled > 0 {
+                        self.position_channel.record_fill(FillRecord::new(
+                            &pair.pair_id, &pair.description, platform2, side2,
+                            no_filled as f64, no_cost as f64 / 100.0 / no_filled as f64,
+                            0.0, &no_order_id,
+                        ));
+                    }
                 }
 
                 Ok(ExecutionResult {
