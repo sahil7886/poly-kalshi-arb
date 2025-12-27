@@ -128,27 +128,44 @@ impl ExecutionEngine {
         // Calculate max contracts from size (min of both sides)
         let mut max_contracts = (req.yes_size.min(req.no_size) / 100) as i64;
 
-        // Log when liquidity significantly constrains order size
-        if max_contracts > 0 && max_contracts < 50 {
-            info!(
-                "[EXEC] 📊 Liquidity-limited: yes={}¢ no={}¢ → {}x",
-                req.yes_size, req.no_size, max_contracts
-            );
+        // Polymarket requires minimum $1 order value (Kalshi has no minimum)
+        // Calculate based on which side is Polymarket for this arb type
+        let min_contracts_for_poly = match req.arb_type {
+            ArbType::PolyYesKalshiNo => {
+                // Poly YES side: ceil(100 / yes_price)
+                if req.yes_price > 0 { (99 / req.yes_price as i64) + 1 } else { 1 }
+            }
+            ArbType::KalshiYesPolyNo => {
+                // Poly NO side: ceil(100 / no_price)
+                if req.no_price > 0 { (99 / req.no_price as i64) + 1 } else { 1 }
+            }
+            ArbType::PolyOnly => {
+                // Both sides are Poly, need max of both
+                let min_yes = if req.yes_price > 0 { (99 / req.yes_price as i64) + 1 } else { 1 };
+                let min_no = if req.no_price > 0 { (99 / req.no_price as i64) + 1 } else { 1 };
+                min_yes.max(min_no)
+            }
+            ArbType::KalshiOnly => 1, // No Poly minimum
+        };
+
+        // Check $1 minimum BEFORE any capping
+        if max_contracts < min_contracts_for_poly {
+            self.release_in_flight(market_id);
+            return Ok(ExecutionResult {
+                market_id,
+                success: false,
+                profit_cents: 0,
+                latency_ns: self.clock.now_ns() - req.detected_ns,
+                error: Some("Below $1 minimum"),
+            });
         }
 
-        // SAFETY: In test mode, cap at 10 contracts
-        // Note: Polymarket has $1 minimum spend, so at 40¢ price, 1 contract = $0.40 (rejected!)
-        // 10 contracts ensures we meet the minimum at any reasonable price
+        // SAFETY: In test mode, cap at 10 (but never below poly minimum)
         if self.test_mode && max_contracts > 10 {
-            warn!("[EXEC] ⚠️ TEST_MODE: Capping contracts from {} to 10", max_contracts);
-            max_contracts = 10;
+            max_contracts = max_contracts.min(10).max(min_contracts_for_poly);
         }
 
         if max_contracts < 1 {
-            // tracing::debug!(
-            //     "[EXEC] Liquidity fail: {:?} | yes_size={}¢ no_size={}¢",
-            //     req.arb_type, req.yes_size, req.no_size
-            // );
             self.release_in_flight(market_id);
             return Ok(ExecutionResult {
                 market_id,
