@@ -537,6 +537,28 @@ impl PolymarketAsyncClient {
         Ok(val["neg_risk"].as_bool().unwrap_or(false))
     }
 
+    /// Get taker fee rate for token (in bps) - zero-latency via defaults
+    /// Per Polymarket docs: https://docs.polymarket.com/polymarket-learn/trading/maker-rebates-program
+    /// - 15-minute crypto markets (BTC, ETH): 1000 bps (10% base, adjusted by price curve)
+    /// - All other markets: 0 bps (fee-free)
+    /// 
+    /// Since we're primarily trading 15-min markets and the error message says
+    /// "current market's taker fee: 1000", we default to 1000 bps.
+    /// Standard markets will accept 0, but we can update the cache if needed.
+    pub async fn get_fee_rate(&self, _token_id: &str) -> Result<u16> {
+        // Default to 1000 bps (10%) for 15-minute crypto markets
+        // This matches the error message: "current market's taker fee: 1000"
+        // 
+        // Per docs, taker fees only apply to 15-minute crypto markets.
+        // Standard markets are fee-free, but will accept any feeRateBps value.
+        // 15-minute markets REQUIRE feeRateBps = 1000 or order is rejected.
+        //
+        // Since our bot primarily trades 15-min BTC/ETH markets, default to 1000.
+        // If we expand to standard markets, we can add logic to detect them
+        // (e.g. by checking market duration or tags) and return 0.
+        Ok(1000)
+    }
+
     #[allow(dead_code)]
     pub fn funder(&self) -> &str {
         &self.funder
@@ -576,6 +598,9 @@ pub struct SharedAsyncClient {
     chain_id: u64,
     /// Pre-cached neg_risk lookups
     neg_risk_cache: std::sync::RwLock<HashMap<String, bool>>,
+    /// Pre-cached taker fee rates (in bps) per token_id
+    /// 15-minute crypto markets: 1000 bps, standard markets: 0 bps
+    fee_rate_cache: std::sync::RwLock<HashMap<String, u16>>,
 }
 
 impl SharedAsyncClient {
@@ -585,6 +610,7 @@ impl SharedAsyncClient {
             creds,
             chain_id,
             neg_risk_cache: std::sync::RwLock::new(HashMap::new()),
+            fee_rate_cache: std::sync::RwLock::new(HashMap::new()),
         }
     }
 
@@ -645,8 +671,24 @@ impl SharedAsyncClient {
             }
         };
 
+        // Check fee_rate cache
+        let fee_rate_bps = {
+            let cache = self.fee_rate_cache.read().unwrap();
+            cache.get(token_id).copied()
+        };
+
+        let fee_rate_bps = match fee_rate_bps {
+            Some(fee) => fee,
+            None => {
+                let fee = self.inner.get_fee_rate(token_id).await?;
+                let mut cache = self.fee_rate_cache.write().unwrap();
+                cache.insert(token_id.to_string(), fee);
+                fee
+            }
+        };
+
         // Build signed order
-        let signed = self.build_signed_order(token_id, price, size, side, neg_risk)?;
+        let signed = self.build_signed_order(token_id, price, size, side, neg_risk, fee_rate_bps)?;
         // Owner must be the API key (not wallet address or funder!)
         let body = signed.post_body(&self.creds.api_key, PolyOrderType::FAK.as_str());
 
@@ -713,6 +755,7 @@ impl SharedAsyncClient {
         size: f64,
         side: &str,
         neg_risk: bool,
+        fee_rate_bps: u16,
     ) -> Result<SignedOrder> {
         let price_bps = price_to_bps(price);
         let size_micro = size_to_micro(size);
@@ -732,6 +775,7 @@ impl SharedAsyncClient {
         let salt = generate_seed();
         let maker_amount_str = maker_amt.to_string();
         let taker_amount_str = taker_amt.to_string();
+        let fee_rate_bps_str = fee_rate_bps.to_string();
 
         // Use references for EIP712 signing 
         let data = OrderData {
@@ -741,7 +785,7 @@ impl SharedAsyncClient {
             maker_amount: &maker_amount_str,
             taker_amount: &taker_amount_str,
             side: side_code,
-            fee_rate_bps: "0",
+            fee_rate_bps: &fee_rate_bps_str,
             nonce: "0",
             signer: &self.inner.wallet_address_str,
             expiration: "0",
@@ -766,7 +810,7 @@ impl SharedAsyncClient {
                 taker_amount: taker_amount_str,
                 expiration: "0".to_string(),
                 nonce: "0".to_string(),
-                fee_rate_bps: "0".to_string(),
+                fee_rate_bps: fee_rate_bps_str,
                 side: side_code,
                 signature_type: 1,
             },

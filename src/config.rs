@@ -14,7 +14,7 @@ pub const POLYMARKET_WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/
 pub const GAMMA_API_BASE: &str = "https://gamma-api.polymarket.com";
 
 /// Arb threshold: alert when total cost < this (e.g., 0.995 = 0.5% profit)
-pub const ARB_THRESHOLD: f64 = 0.90;
+pub const ARB_THRESHOLD: f64 = 0.94;
 
 /// Dry-run cooldown: minimum seconds between executions of the same market
 /// This prevents logging the same arb repeatedly when liquidity isn't consumed
