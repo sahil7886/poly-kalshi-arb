@@ -2,8 +2,9 @@
 // Execution Engine
 
 use anyhow::{Result, anyhow};
+use dashmap::DashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicI64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{info, warn, error};
@@ -16,6 +17,7 @@ use crate::types::{
     cents_to_price,
 };
 use crate::circuit_breaker::CircuitBreaker;
+use crate::config::{DRY_RUN_COOLDOWN_SECS, MAX_ORDERBOOK_STALENESS_MS, TEST_MODE_MAX_EXPOSURE_CENTS};
 use crate::position_tracker::{FillRecord, PositionChannel};
 
 // =============================================================================
@@ -56,6 +58,12 @@ pub struct ExecutionEngine {
     pub dry_run: bool,
     test_mode: bool,
     dashboard: Option<Arc<crate::dashboard::DashboardState>>,
+    /// Track last execution time per market (dry_run only)
+    dry_run_tracker: Arc<DashMap<u16, Instant>>,
+    /// Track current exposure on Polymarket in cents (test mode only)
+    poly_exposure_cents: AtomicI64,
+    /// Track current exposure on Kalshi in cents (test mode only)
+    kalshi_exposure_cents: AtomicI64,
 }
 
 impl ExecutionEngine {
@@ -83,6 +91,9 @@ impl ExecutionEngine {
             dry_run,
             test_mode,
             dashboard,
+            dry_run_tracker: Arc::new(DashMap::new()),
+            poly_exposure_cents: AtomicI64::new(0),
+            kalshi_exposure_cents: AtomicI64::new(0),
         }
     }
 
@@ -164,9 +175,86 @@ impl ExecutionEngine {
             });
         }
 
-        // SAFETY: In test mode, cap at 10 (but never below poly minimum)
-        if self.test_mode && max_contracts > 10 {
-            max_contracts = max_contracts.min(10).max(min_contracts_for_poly);
+        // SAFETY: In test mode, limit exposure per platform
+        if self.test_mode {
+            // Calculate exposure per contract for each platform (in cents)
+            let (poly_exposure_per_contract, kalshi_exposure_per_contract) = match req.arb_type {
+                ArbType::PolyYesKalshiNo => {
+                    // Buy Poly YES (pay yes_price), Sell Kalshi NO (liable for 100-no_price)
+                    (req.yes_price as i64, (100 - req.no_price) as i64)
+                }
+                ArbType::KalshiYesPolyNo => {
+                    // Buy Kalshi YES (pay yes_price), Sell Poly NO (liable for 100-no_price)
+                    ((100 - req.no_price) as i64, req.yes_price as i64)
+                }
+                ArbType::PolyOnly => {
+                    // Buy one side, sell the other - both on Poly
+                    // Take max exposure of the two sides
+                    let yes_exp = req.yes_price as i64;
+                    let no_exp = (100 - req.no_price) as i64;
+                    (yes_exp.max(no_exp), 0)
+                }
+                ArbType::KalshiOnly => {
+                    // Buy one side, sell the other - both on Kalshi
+                    let yes_exp = req.yes_price as i64;
+                    let no_exp = (100 - req.no_price) as i64;
+                    (0, yes_exp.max(no_exp))
+                }
+            };
+
+            // Get current exposure on each platform
+            let current_poly = self.poly_exposure_cents.load(Ordering::Relaxed);
+            let current_kalshi = self.kalshi_exposure_cents.load(Ordering::Relaxed);
+
+            // Calculate how many contracts we can afford on each platform
+            let mut max_affordable = max_contracts;
+
+            if poly_exposure_per_contract > 0 {
+                let poly_remaining = TEST_MODE_MAX_EXPOSURE_CENTS - current_poly;
+                if poly_remaining <= 0 {
+                    self.release_in_flight(market_id);
+                    return Ok(ExecutionResult {
+                        market_id,
+                        success: false,
+                        profit_cents: 0,
+                        latency_ns: self.clock.now_ns() - req.detected_ns,
+                        error: Some("Poly exposure limit reached"),
+                    });
+                }
+                let poly_affordable = poly_remaining / poly_exposure_per_contract;
+                max_affordable = max_affordable.min(poly_affordable);
+            }
+
+            if kalshi_exposure_per_contract > 0 {
+                let kalshi_remaining = TEST_MODE_MAX_EXPOSURE_CENTS - current_kalshi;
+                if kalshi_remaining <= 0 {
+                    self.release_in_flight(market_id);
+                    return Ok(ExecutionResult {
+                        market_id,
+                        success: false,
+                        profit_cents: 0,
+                        latency_ns: self.clock.now_ns() - req.detected_ns,
+                        error: Some("Kalshi exposure limit reached"),
+                    });
+                }
+                let kalshi_affordable = kalshi_remaining / kalshi_exposure_per_contract;
+                max_affordable = max_affordable.min(kalshi_affordable);
+            }
+
+            // Cap max_contracts but never go below poly minimum
+            max_contracts = max_affordable.max(min_contracts_for_poly);
+
+            // If we can't even afford the minimum, skip this trade
+            if max_affordable < min_contracts_for_poly {
+                self.release_in_flight(market_id);
+                return Ok(ExecutionResult {
+                    market_id,
+                    success: false,
+                    profit_cents: 0,
+                    latency_ns: self.clock.now_ns() - req.detected_ns,
+                    error: None, // Silent skip - exposure limit
+                });
+            }
         }
 
         if max_contracts < 1 {
@@ -193,8 +281,60 @@ impl ExecutionEngine {
         }
 
         let latency_to_exec = self.clock.now_ns() - req.detected_ns;
+
+        // DRY RUN COOLDOWN: Skip if this market was executed too recently
+        // This prevents spam when liquidity isn't actually consumed
+        if self.dry_run {
+            if let Some(last_exec) = self.dry_run_tracker.get(&market_id) {
+                let elapsed = last_exec.elapsed();
+                if elapsed < Duration::from_secs(DRY_RUN_COOLDOWN_SECS) {
+                    let _remaining = DRY_RUN_COOLDOWN_SECS.saturating_sub(elapsed.as_secs());
+                    self.release_in_flight(market_id);
+                    return Ok(ExecutionResult {
+                        market_id,
+                        success: false,
+                        profit_cents: 0,
+                        latency_ns: latency_to_exec,
+                        error: None, // Silent skip - cooldown active
+                    });
+                }
+            }
+        }
+
+        // Check for stale orderbook data
+        let kalshi_stale = market.kalshi.is_stale(MAX_ORDERBOOK_STALENESS_MS);
+        let poly_stale = market.poly.is_stale(MAX_ORDERBOOK_STALENESS_MS);
+
+        if kalshi_stale || poly_stale {
+            let stale_platform = if kalshi_stale && poly_stale {
+                "Kalshi+Poly"
+            } else if kalshi_stale {
+                "Kalshi"
+            } else {
+                "Poly"
+            };
+            
+            warn!(
+                "[EXEC] 🕒 Stale {} data for market_id={} ({}), age: K={}s P={}s",
+                stale_platform,
+                market_id,
+                pair.description,
+                market.kalshi.age_ms() / 1000,
+                market.poly.age_ms() / 1000
+            );
+            
+            self.release_in_flight(market_id);
+            return Ok(ExecutionResult {
+                market_id,
+                success: false,
+                profit_cents: 0,
+                latency_ns: latency_to_exec,
+                error: Some("Stale orderbook"),
+            });
+        }
         
         // Record arb detection in dashboard (non-blocking)
+        // AFTER cooldown check to avoid recording spammed arbs
         if let Some(ref dash) = self.dashboard {
             let min_liq = (req.yes_size.min(req.no_size) / 100) as u32;
             dash.record_arb(profit_cents, min_liq);
@@ -214,6 +354,9 @@ impl ExecutionEngine {
         if self.dry_run {
             info!("[EXEC] 🏃 DRY RUN - would execute {} contracts", max_contracts);
             
+            
+            // Update last execution time for this market
+            self.dry_run_tracker.insert(market_id, Instant::now());
             // Record simulated trade in dashboard
             let total_profit = profit_cents as i16 * max_contracts as i16;
             if let Some(ref dash) = self.dashboard {
@@ -288,7 +431,44 @@ impl ExecutionEngine {
 
                 if success {
                     self.circuit_breaker.record_success(&pair.pair_id, matched, matched, actual_profit as f64 / 100.0).await;
-                    
+
+                    // Update exposure tracking in test mode
+                    if self.test_mode {
+                        let (poly_exp, kalshi_exp) = match req.arb_type {
+                            ArbType::PolyYesKalshiNo => {
+                                (req.yes_price as i64 * matched, (100 - req.no_price) as i64 * matched)
+                            }
+                            ArbType::KalshiYesPolyNo => {
+                                ((100 - req.no_price) as i64 * matched, req.yes_price as i64 * matched)
+                            }
+                            ArbType::PolyOnly => {
+                                let yes_exp = req.yes_price as i64;
+                                let no_exp = (100 - req.no_price) as i64;
+                                (yes_exp.max(no_exp) * matched, 0)
+                            }
+                            ArbType::KalshiOnly => {
+                                let yes_exp = req.yes_price as i64;
+                                let no_exp = (100 - req.no_price) as i64;
+                                (0, yes_exp.max(no_exp) * matched)
+                            }
+                        };
+
+                        if poly_exp > 0 {
+                            let new_poly = self.poly_exposure_cents.fetch_add(poly_exp, Ordering::Relaxed) + poly_exp;
+                            info!("[EXPOSURE] Poly: +${:.2} -> ${:.2}/{:.2}",
+                                poly_exp as f64 / 100.0,
+                                new_poly as f64 / 100.0,
+                                TEST_MODE_MAX_EXPOSURE_CENTS as f64 / 100.0);
+                        }
+                        if kalshi_exp > 0 {
+                            let new_kalshi = self.kalshi_exposure_cents.fetch_add(kalshi_exp, Ordering::Relaxed) + kalshi_exp;
+                            info!("[EXPOSURE] Kalshi: +${:.2} -> ${:.2}/{:.2}",
+                                kalshi_exp as f64 / 100.0,
+                                new_kalshi as f64 / 100.0,
+                                TEST_MODE_MAX_EXPOSURE_CENTS as f64 / 100.0);
+                        }
+                    }
+
                     // Record trade in dashboard
                     if let Some(ref dash) = self.dashboard {
                         dash.record_trade(actual_profit, actual_profit > 0);
@@ -714,11 +894,14 @@ pub async fn run_execution_loop(
                     );
                 }
                 Ok(result) => {
-                    if result.error != Some("Already in-flight") {
-                        warn!(
-                            "[EXEC] ⚠️ market_id={}: {:?}",
-                            result.market_id, result.error
-                        );
+                    // Only log actual errors (not silent skips like cooldown or already-in-flight)
+                    if let Some(error_msg) = result.error {
+                        if error_msg != "Already in-flight" {
+                            warn!(
+                                "[EXEC] ⚠️ market_id={}: {}",
+                                result.market_id, error_msg
+                            );
+                        }
                     }
                 }
                 Err(e) => {

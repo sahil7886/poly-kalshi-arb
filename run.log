@@ -1,0 +1,191 @@
+   Compiling arb-bot v2.0.0 (/Users/sahil/Documents/Projects/poly-kalshi-arb)
+warning: unused import: `Context`
+ --> src/discovery.rs:8:14
+  |
+8 | use anyhow::{Context, Result};
+  |              ^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused attribute
+   --> src/types.rs:275:1
+    |
+275 | #[inline(always)]
+    | ^^^^^^^^^^^^^^^^^ help: remove this attribute
+    |
+note: attribute also specified here
+   --> src/types.rs:274:1
+    |
+274 | #[inline(always)]
+    | ^^^^^^^^^^^^^^^^^
+    = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+    = note: `#[warn(unused_attributes)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `price`
+   --> src/execution.rs:635:35
+    |
+635 |                 let (token, side, price) = if yes_filled > no_filled {
+    |                                   ^^^^^ help: if this is intentional, prefix it with an underscore: `_price`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `price`
+   --> src/execution.rs:652:28
+    |
+652 |                 let (side, price) = if yes_filled > no_filled {
+    |                            ^^^^^ help: if this is intentional, prefix it with an underscore: `_price`
+
+warning: `arb-bot` (lib) generated 4 warnings (run `cargo fix --lib -p arb-bot` to apply 4 suggestions)
+warning: unused import: `watch`
+  --> src/main.rs:21:27
+   |
+21 | use tokio::sync::{RwLock, watch};
+   |                           ^^^^^
+
+warning: unused import: `ethers::types::U256`
+  --> src/main.rs:23:5
+   |
+23 | use ethers::types::U256;
+   |     ^^^^^^^^^^^^^^^^^^^
+
+warning: variable does not need to be mutable
+  --> src/main.rs:80:13
+   |
+80 |         let mut s = GlobalState::new();
+   |             ----^
+   |             |
+   |             help: remove this `mut`
+   |
+   = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `t`
+   --> src/main.rs:254:24
+    |
+254 |                    let t = market.pair().map(|p| p.kalshi_market_ticker.to_string()).unwrap_or_else(|| "?".to_string());
+    |                        ^ help: if this is intentional, prefix it with an underscore: `_t`
+
+warning: constant `POLY_BTC15M_SERIES` is never used
+  --> src/config.rs:61:11
+   |
+61 | pub const POLY_BTC15M_SERIES: &str = "btc-up-or-down-15m";
+   |           ^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `update_market` is never used
+   --> src/dashboard.rs:105:18
+    |
+ 74 | impl DashboardState {
+    | ------------------- method in this implementation
+...
+105 |     pub async fn update_market(&self, id: String, market: MarketDisplay) {
+    |                  ^^^^^^^^^^^^^
+
+warning: constant `CACHE_TTL_SECS` is never used
+  --> src/discovery.rs:37:7
+   |
+37 | const CACHE_TTL_SECS: u64 = 2 * 60 * 60;
+   |       ^^^^^^^^^^^^^^
+
+warning: methods `is_expired` and `age_secs` are never used
+  --> src/discovery.rs:74:8
+   |
+62 | impl DiscoveryCache {
+   | ------------------- methods in this implementation
+...
+74 |     fn is_expired(&self) -> bool {
+   |        ^^^^^^^^^^
+...
+79 |     fn age_secs(&self) -> u64 {
+   |        ^^^^^^^^
+
+warning: associated items `load_cache`, `discover_all`, and `discover_incremental` are never used
+   --> src/discovery.rs:122:14
+    |
+105 | impl DiscoveryClient {
+    | -------------------- associated items in this implementation
+...
+122 |     async fn load_cache() -> Option<DiscoveryCache> {
+    |              ^^^^^^^^^^
+...
+141 |     pub async fn discover_all(&self, leagues: &[&str]) -> DiscoveryResult {
+    |                  ^^^^^^^^^^^^
+...
+276 |     async fn discover_incremental(&self, leagues: &[&str], cache: DiscoveryCache) -> DiscoveryResult {
+    |              ^^^^^^^^^^^^^^^^^^^^
+
+warning: `arb-bot` (bin "arb-bot") generated 13 warnings (4 duplicates) (run `cargo fix --bin "arb-bot" -p arb-bot` to apply 4 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 16.36s
+     Running `target/debug/arb-bot`
+[2m2026-01-14T05:35:48.612221Z[0m [32m INFO[0m [2marb_bot[0m[2m:[0m 🎯 Arb Bot v2.0 - Supervisor Mode
+[2m2026-01-14T05:35:48.612269Z[0m [32m INFO[0m [2marb_bot[0m[2m:[0m    Threshold: <94.0¢ for 6.0% profit
+[2m2026-01-14T05:35:48.612325Z[0m [32m INFO[0m [2marb_bot[0m[2m:[0m    Leagues: []
+[2m2026-01-14T05:35:48.612392Z[0m [32m INFO[0m [2marb_bot[0m[2m:[0m    Mode: DRY RUN (set DRY_RUN=0 to execute)
+[2m2026-01-14T05:35:48.614625Z[0m [32m INFO[0m [2marb_bot[0m[2m:[0m [KALSHI] API key loaded
+[2m2026-01-14T05:35:48.614656Z[0m [32m INFO[0m [2marb_bot[0m[2m:[0m [POLYMARKET] Creating async client and deriving API credentials...
+[2m2026-01-14T05:35:48.936394Z[0m [33m WARN[0m [2marb_bot[0m[2m:[0m [POLYMARKET] Could not load neg_risk cache: No such file or directory (os error 2)
+[2m2026-01-14T05:35:48.937185Z[0m [32m INFO[0m [2marb_bot[0m[2m:[0m [POLYMARKET] Client ready
+[2m2026-01-14T05:35:48.937321Z[0m [32m INFO[0m [2marb_bot[0m[2m:[0m    Funder: 0xE800bfAd22c05608069Be93f4a97736e7878357a
+[2m2026-01-14T05:35:48.937340Z[0m [32m INFO[0m [2marb_bot[0m[2m:[0m    Signer (needs MATIC): 0xcf4fcef84e8c953c0ec4e7183614e22ccb2e4d99
+[2m2026-01-14T05:35:48.940510Z[0m [33m WARN[0m [2marb_bot::cache[0m[2m:[0m Failed to parse team cache: missing field `forward` at line 1170 column 1
+[2m2026-01-14T05:35:48.940626Z[0m [32m INFO[0m [2marb_bot[0m[2m:[0m 📂 Loaded 0 team mappings
+[2m2026-01-14T05:35:49.145831Z[0m [32m INFO[0m [2marb_bot[0m[2m:[0m 🔄 REQUESTING SESSION (4h)...
+[2m2026-01-14T05:35:49.145898Z[0m [32m INFO[0m [2marb_bot[0m[2m:[0m 🔍 Discovering markets (forced refresh)...
+[2m2026-01-14T05:35:49.145958Z[0m [32m INFO[0m [2marb_bot::discovery[0m[2m:[0m 🔄 Forced full discovery (ignoring cache)...
+[2m2026-01-14T05:35:49.145992Z[0m [32m INFO[0m [2marb_bot::discovery[0m[2m:[0m ₿ Discovering BTC 15m Up/Down markets...
+[2m2026-01-14T05:35:49.147047Z[0m [32m INFO[0m [2marb_bot::dashboard[0m[2m:[0m [DASHBOARD] Server running at http://localhost:5051
+[2m2026-01-14T05:35:49.464688Z[0m [32m INFO[0m [2marb_bot::discovery[0m[2m:[0m   ✅ Found 17 Kalshi BTC 15m markets (filtered from 100)
+[2m2026-01-14T05:35:49.737116Z[0m [32m INFO[0m [2marb_bot::discovery[0m[2m:[0m   ✓ Matched: KXBTC15M-26JAN140445-45 <-> btc-updown-15m-1768383000
+[2m2026-01-14T05:35:49.864023Z[0m [32m INFO[0m [2marb_bot::discovery[0m[2m:[0m   ✓ Matched: KXBTC15M-26JAN140430-30 <-> btc-updown-15m-1768382100
+[2m2026-01-14T05:35:50.033779Z[0m [32m INFO[0m [2marb_bot::discovery[0m[2m:[0m   ✓ Matched: KXBTC15M-26JAN140415-15 <-> btc-updown-15m-1768381200
+[2m2026-01-14T05:35:50.261925Z[0m [32m INFO[0m [2marb_bot::discovery[0m[2m:[0m   ✓ Matched: KXBTC15M-26JAN140400-00 <-> btc-updown-15m-1768380300
+[2m2026-01-14T05:35:50.388494Z[0m [32m INFO[0m [2marb_bot::discovery[0m[2m:[0m   ✓ Matched: KXBTC15M-26JAN140345-45 <-> btc-updown-15m-1768379400
+[2m2026-01-14T05:35:50.540841Z[0m [32m INFO[0m [2marb_bot::discovery[0m[2m:[0m   ✓ Matched: KXBTC15M-26JAN140330-30 <-> btc-updown-15m-1768378500
+[2m2026-01-14T05:35:50.691183Z[0m [32m INFO[0m [2marb_bot::discovery[0m[2m:[0m   ✓ Matched: KXBTC15M-26JAN140315-15 <-> btc-updown-15m-1768377600
+[2m2026-01-14T05:35:50.919535Z[0m [32m INFO[0m [2marb_bot::discovery[0m[2m:[0m   ✓ Matched: KXBTC15M-26JAN140300-00 <-> btc-updown-15m-1768376700
+[2m2026-01-14T05:35:51.057006Z[0m [32m INFO[0m [2marb_bot::discovery[0m[2m:[0m   ✓ Matched: KXBTC15M-26JAN140245-45 <-> btc-updown-15m-1768375800
+[2m2026-01-14T05:35:51.201198Z[0m [32m INFO[0m [2marb_bot::discovery[0m[2m:[0m   ✓ Matched: KXBTC15M-26JAN140230-30 <-> btc-updown-15m-1768374900
+[2m2026-01-14T05:35:51.329313Z[0m [32m INFO[0m [2marb_bot::discovery[0m[2m:[0m   ✓ Matched: KXBTC15M-26JAN140215-15 <-> btc-updown-15m-1768374000
+[2m2026-01-14T05:35:51.459220Z[0m [32m INFO[0m [2marb_bot::discovery[0m[2m:[0m   ✓ Matched: KXBTC15M-26JAN140200-00 <-> btc-updown-15m-1768373100
+[2m2026-01-14T05:35:51.618430Z[0m [32m INFO[0m [2marb_bot::discovery[0m[2m:[0m   ✓ Matched: KXBTC15M-26JAN140145-45 <-> btc-updown-15m-1768372200
+[2m2026-01-14T05:35:51.835222Z[0m [32m INFO[0m [2marb_bot::discovery[0m[2m:[0m   ✓ Matched: KXBTC15M-26JAN140130-30 <-> btc-updown-15m-1768371300
+[2m2026-01-14T05:35:51.971676Z[0m [32m INFO[0m [2marb_bot::discovery[0m[2m:[0m   ✓ Matched: KXBTC15M-26JAN140115-15 <-> btc-updown-15m-1768370400
+[2m2026-01-14T05:35:52.107726Z[0m [32m INFO[0m [2marb_bot::discovery[0m[2m:[0m   ✓ Matched: KXBTC15M-26JAN140100-00 <-> btc-updown-15m-1768369500
+[2m2026-01-14T05:35:52.243704Z[0m [32m INFO[0m [2marb_bot::discovery[0m[2m:[0m   ✓ Matched: KXBTC15M-26JAN140045-45 <-> btc-updown-15m-1768368600
+[2m2026-01-14T05:35:52.243741Z[0m [32m INFO[0m [2marb_bot::discovery[0m[2m:[0m ₿ BTC 15m discovery complete: 17 pairs matched, 0 misses
+[2m2026-01-14T05:35:52.245809Z[0m [32m INFO[0m [2marb_bot::discovery[0m[2m:[0m 💾 Saved 17 pairs to cache
+[2m2026-01-14T05:35:52.245832Z[0m [32m INFO[0m [2marb_bot[0m[2m:[0m 📊 Discovery complete: 17 pairs found
+[2m2026-01-14T05:35:52.245839Z[0m [32m INFO[0m [2marb_bot[0m[2m:[0m 📋 Matched markets:
+[2m2026-01-14T05:35:52.245877Z[0m [32m INFO[0m [2marb_bot[0m[2m:[0m    ✅ BTC price up in next 15 mins? | btc15m | K:KXBTC15M-26JAN140445-45
+[2m2026-01-14T05:35:52.245885Z[0m [32m INFO[0m [2marb_bot[0m[2m:[0m    ✅ BTC price up in next 15 mins? | btc15m | K:KXBTC15M-26JAN140430-30
+[2m2026-01-14T05:35:52.245891Z[0m [32m INFO[0m [2marb_bot[0m[2m:[0m    ✅ BTC price up in next 15 mins? | btc15m | K:KXBTC15M-26JAN140415-15
+[2m2026-01-14T05:35:52.245896Z[0m [32m INFO[0m [2marb_bot[0m[2m:[0m    ✅ BTC price up in next 15 mins? | btc15m | K:KXBTC15M-26JAN140400-00
+[2m2026-01-14T05:35:52.245903Z[0m [32m INFO[0m [2marb_bot[0m[2m:[0m    ✅ BTC price up in next 15 mins? | btc15m | K:KXBTC15M-26JAN140345-45
+[2m2026-01-14T05:35:52.245908Z[0m [32m INFO[0m [2marb_bot[0m[2m:[0m    ✅ BTC price up in next 15 mins? | btc15m | K:KXBTC15M-26JAN140330-30
+[2m2026-01-14T05:35:52.245914Z[0m [32m INFO[0m [2marb_bot[0m[2m:[0m    ✅ BTC price up in next 15 mins? | btc15m | K:KXBTC15M-26JAN140315-15
+[2m2026-01-14T05:35:52.245921Z[0m [32m INFO[0m [2marb_bot[0m[2m:[0m    ✅ BTC price up in next 15 mins? | btc15m | K:KXBTC15M-26JAN140300-00
+[2m2026-01-14T05:35:52.245926Z[0m [32m INFO[0m [2marb_bot[0m[2m:[0m    ✅ BTC price up in next 15 mins? | btc15m | K:KXBTC15M-26JAN140245-45
+[2m2026-01-14T05:35:52.245932Z[0m [32m INFO[0m [2marb_bot[0m[2m:[0m    ✅ BTC price up in next 15 mins? | btc15m | K:KXBTC15M-26JAN140230-30
+[2m2026-01-14T05:35:52.245939Z[0m [32m INFO[0m [2marb_bot[0m[2m:[0m    ✅ BTC price up in next 15 mins? | btc15m | K:KXBTC15M-26JAN140215-15
+[2m2026-01-14T05:35:52.245945Z[0m [32m INFO[0m [2marb_bot[0m[2m:[0m    ✅ BTC price up in next 15 mins? | btc15m | K:KXBTC15M-26JAN140200-00
+[2m2026-01-14T05:35:52.245950Z[0m [32m INFO[0m [2marb_bot[0m[2m:[0m    ✅ BTC price up in next 15 mins? | btc15m | K:KXBTC15M-26JAN140145-45
+[2m2026-01-14T05:35:52.245956Z[0m [32m INFO[0m [2marb_bot[0m[2m:[0m    ✅ BTC price up in next 15 mins? | btc15m | K:KXBTC15M-26JAN140130-30
+[2m2026-01-14T05:35:52.245964Z[0m [32m INFO[0m [2marb_bot[0m[2m:[0m    ✅ BTC price up in next 15 mins? | btc15m | K:KXBTC15M-26JAN140115-15
+[2m2026-01-14T05:35:52.245970Z[0m [32m INFO[0m [2marb_bot[0m[2m:[0m    ✅ BTC price up in next 15 mins? | btc15m | K:KXBTC15M-26JAN140100-00
+[2m2026-01-14T05:35:52.245975Z[0m [32m INFO[0m [2marb_bot[0m[2m:[0m    ✅ BTC price up in next 15 mins? | btc15m | K:KXBTC15M-26JAN140045-45
+[2m2026-01-14T05:35:52.246207Z[0m [32m INFO[0m [2marb_bot[0m[2m:[0m 📡 State: Tracking 17 markets
+[2m2026-01-14T05:35:52.246311Z[0m [32m INFO[0m [2marb_bot::circuit_breaker[0m[2m:[0m [CB] Circuit breaker initialized:
+[2m2026-01-14T05:35:52.246317Z[0m [32m INFO[0m [2marb_bot::circuit_breaker[0m[2m:[0m [CB]   Enabled: false
+[2m2026-01-14T05:35:52.246322Z[0m [32m INFO[0m [2marb_bot::circuit_breaker[0m[2m:[0m [CB]   Max position per market: 5 contracts
+[2m2026-01-14T05:35:52.246327Z[0m [32m INFO[0m [2marb_bot::circuit_breaker[0m[2m:[0m [CB]   Max total position: 10 contracts
+[2m2026-01-14T05:35:52.246332Z[0m [32m INFO[0m [2marb_bot::circuit_breaker[0m[2m:[0m [CB]   Max daily loss: $3.00
+[2m2026-01-14T05:35:52.246341Z[0m [32m INFO[0m [2marb_bot::circuit_breaker[0m[2m:[0m [CB]   Max consecutive errors: 3
+[2m2026-01-14T05:35:52.246346Z[0m [32m INFO[0m [2marb_bot::circuit_breaker[0m[2m:[0m [CB]   Cooldown: 600s
+[2m2026-01-14T05:35:52.246509Z[0m [32m INFO[0m [2marb_bot::execution[0m[2m:[0m [EXEC] Execution engine started (dry_run=true)
+[2m2026-01-14T05:35:52.246533Z[0m [32m INFO[0m [2marb_bot[0m[2m:[0m ⏱️  Session running for 14400 seconds...
+[2m2026-01-14T05:35:52.247735Z[0m [32m INFO[0m [2marb_bot[0m[2m:[0m 💓 Heartbeat | Markets: 17 total, 0 w/Kalshi, 0 w/Poly, 0 w/Overlap | threshold=94¢
+[2m2026-01-14T05:35:52.247747Z[0m [33m WARN[0m [2marb_bot[0m[2m:[0m  ⚠️ No actionable overlap (missing crossing sides) - check liquidity
+[2m2026-01-14T05:35:52.474583Z[0m [32m INFO[0m [2marb_bot::kalshi[0m[2m:[0m [KALSHI] Connected
+[2m2026-01-14T05:35:52.474811Z[0m [32m INFO[0m [2marb_bot::kalshi[0m[2m:[0m [KALSHI] Subscribed to 17 markets (orderbook_delta)
+[2m2026-01-14T05:35:52.694576Z[0m [32m INFO[0m [2marb_bot::polymarket[0m[2m:[0m [POLY] Connected
+[2m2026-01-14T05:35:52.694808Z[0m [32m INFO[0m [2marb_bot::polymarket[0m[2m:[0m [POLY] Subscribed to 34 tokens

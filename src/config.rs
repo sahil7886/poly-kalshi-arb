@@ -14,7 +14,19 @@ pub const POLYMARKET_WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/
 pub const GAMMA_API_BASE: &str = "https://gamma-api.polymarket.com";
 
 /// Arb threshold: alert when total cost < this (e.g., 0.995 = 0.5% profit)
-pub const ARB_THRESHOLD: f64 = 0.96;
+pub const ARB_THRESHOLD: f64 = 0.90;
+
+/// Dry-run cooldown: minimum seconds between executions of the same market
+/// This prevents logging the same arb repeatedly when liquidity isn't consumed
+pub const DRY_RUN_COOLDOWN_SECS: u64 = 60;
+
+/// Maximum age of orderbook data before considered stale (milliseconds)
+/// 5 seconds = trades shouldn't execute on data older than this (active markets)
+pub const MAX_ORDERBOOK_STALENESS_MS: u64 = 5_000;
+
+/// Max exposure in cents per platform in test mode (SAFETY CAP)
+/// $5 = 500 cents maximum exposure on each platform at any given time
+pub const TEST_MODE_MAX_EXPOSURE_CENTS: i64 = 500;
 
 /// Polymarket ping interval (seconds) - keep connection alive
 pub const POLY_PING_INTERVAL_SECS: u64 = 30;

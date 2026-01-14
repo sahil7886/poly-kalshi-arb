@@ -3,6 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, AtomicU16, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::sync::{Arc, RwLock};
 use dashmap::DashMap;
 
@@ -83,11 +84,17 @@ pub fn unpack_orderbook(packed: u64) -> (PriceCents, PriceCents, SizeCents, Size
 pub struct AtomicOrderbook {
     /// Packed state: [yes_ask:16][no_ask:16][yes_size:16][no_size:16]
     packed: AtomicU64,
+    /// Last update timestamp in milliseconds (Unix epoch)
+    /// Used for staleness detection
+    pub last_update_ms: AtomicU64,
 }
 
 impl AtomicOrderbook {
     pub const fn new() -> Self {
-        Self { packed: AtomicU64::new(0) }
+        Self { 
+            packed: AtomicU64::new(0),
+            last_update_ms: AtomicU64::new(0),
+        }
     }
 
     /// Load current state
@@ -100,6 +107,7 @@ impl AtomicOrderbook {
     #[inline(always)]
     pub fn store(&self, yes_ask: PriceCents, no_ask: PriceCents, yes_size: SizeCents, no_size: SizeCents) {
         self.packed.store(pack_orderbook(yes_ask, no_ask, yes_size, no_size), Ordering::Release);
+        self.update_timestamp();
     }
 
     /// Update YES side only
@@ -110,7 +118,10 @@ impl AtomicOrderbook {
             let (_, no_ask, _, no_size) = unpack_orderbook(current);
             let new = pack_orderbook(yes_ask, no_ask, yes_size, no_size);
             match self.packed.compare_exchange_weak(current, new, Ordering::AcqRel, Ordering::Acquire) {
-                Ok(_) => break,
+                Ok(_) => {
+                    self.update_timestamp();
+                    break;
+                }
                 Err(c) => current = c,
             }
         }
@@ -124,10 +135,43 @@ impl AtomicOrderbook {
             let (yes_ask, _, yes_size, _) = unpack_orderbook(current);
             let new = pack_orderbook(yes_ask, no_ask, yes_size, no_size);
             match self.packed.compare_exchange_weak(current, new, Ordering::AcqRel, Ordering::Acquire) {
-                Ok(_) => break,
+                Ok(_) => {
+                    self.update_timestamp();
+                    break;
+                }
                 Err(c) => current = c,
             }
         }
+    }
+
+    /// Update timestamp to current time
+    #[inline(always)]
+    fn update_timestamp(&self) {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        self.last_update_ms.store(now_ms, Ordering::Relaxed);
+    }
+
+    /// Get age of data in milliseconds
+    #[inline(always)]
+    pub fn age_ms(&self) -> u64 {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let last = self.last_update_ms.load(Ordering::Relaxed);
+        if last == 0 {
+            return u64::MAX; // Never updated
+        }
+        now_ms.saturating_sub(last)
+    }
+
+    /// Check if data is stale
+    #[inline(always)]
+    pub fn is_stale(&self, max_age_ms: u64) -> bool {
+        self.age_ms() > max_age_ms
     }
 }
 
