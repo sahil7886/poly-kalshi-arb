@@ -55,6 +55,7 @@ pub struct ExecutionEngine {
     clock: NanoClock,
     pub dry_run: bool,
     test_mode: bool,
+    dashboard: Option<Arc<crate::dashboard::DashboardState>>,
 }
 
 impl ExecutionEngine {
@@ -65,6 +66,7 @@ impl ExecutionEngine {
         circuit_breaker: Arc<CircuitBreaker>,
         position_channel: PositionChannel,
         dry_run: bool,
+        dashboard: Option<Arc<crate::dashboard::DashboardState>>,
     ) -> Self {
         let test_mode = std::env::var("TEST_ARB")
             .map(|v| v == "1" || v == "true")
@@ -80,6 +82,7 @@ impl ExecutionEngine {
             clock: NanoClock::new(),
             dry_run,
             test_mode,
+            dashboard,
         }
     }
 
@@ -190,6 +193,13 @@ impl ExecutionEngine {
         }
 
         let latency_to_exec = self.clock.now_ns() - req.detected_ns;
+        
+        // Record arb detection in dashboard (non-blocking)
+        if let Some(ref dash) = self.dashboard {
+            let min_liq = (req.yes_size.min(req.no_size) / 100) as u32;
+            dash.record_arb(profit_cents, min_liq);
+        }
+        
         info!(
             "[EXEC] 🎯 {} | {:?} y={}¢ n={}¢ | profit={}¢ | {}x | {}µs",
             pair.description,
@@ -203,11 +213,25 @@ impl ExecutionEngine {
 
         if self.dry_run {
             info!("[EXEC] 🏃 DRY RUN - would execute {} contracts", max_contracts);
+            
+            // Record simulated trade in dashboard
+            let total_profit = profit_cents as i16 * max_contracts as i16;
+            if let Some(ref dash) = self.dashboard {
+                dash.record_trade(total_profit, total_profit > 0);
+                dash.push_trade(crate::dashboard::TradeEvent {
+                    action: format!("{:?}", req.arb_type),
+                    asset: pair.description.to_string(),
+                    size: max_contracts as f64,
+                    pnl: Some(total_profit as f64 / 100.0),
+                    time: chrono::Local::now().format("%H:%M:%S").to_string(),
+                });
+            }
+            
             self.release_in_flight_delayed(market_id);
             return Ok(ExecutionResult {
                 market_id,
                 success: true,
-                profit_cents,
+                profit_cents: total_profit,
                 latency_ns: latency_to_exec,
                 error: Some("DRY_RUN"),
             });
@@ -264,6 +288,18 @@ impl ExecutionEngine {
 
                 if success {
                     self.circuit_breaker.record_success(&pair.pair_id, matched, matched, actual_profit as f64 / 100.0).await;
+                    
+                    // Record trade in dashboard
+                    if let Some(ref dash) = self.dashboard {
+                        dash.record_trade(actual_profit, actual_profit > 0);
+                        dash.push_trade(crate::dashboard::TradeEvent {
+                            action: format!("{:?}", req.arb_type),
+                            asset: pair.description.to_string(),
+                            size: matched as f64,
+                            pnl: Some(actual_profit as f64 / 100.0),
+                            time: chrono::Local::now().format("%H:%M:%S").to_string(),
+                        });
+                    }
                 }
 
                 if matched > 0 {
@@ -635,7 +671,7 @@ impl ExecutionEngine {
             let slot = (market_id / 64) as usize;
             let bit = market_id % 64;
             tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_secs(10)).await;
+                tokio::time::sleep(Duration::from_secs(2)).await;
                 let mask = !(1u64 << bit);
                 in_flight[slot].fetch_and(mask, Ordering::Release);
             });
@@ -678,13 +714,11 @@ pub async fn run_execution_loop(
                     );
                 }
                 Ok(result) => {
-                    if result.error != Some("Already in-flight") && result.error != Some("Insufficient liquidity") {
+                    if result.error != Some("Already in-flight") {
                         warn!(
                             "[EXEC] ⚠️ market_id={}: {:?}",
                             result.market_id, result.error
                         );
-                    } else if result.error == Some("Insufficient liquidity") {
-                        tracing::debug!("[EXEC] ⚠️ market_id={}: Insufficient liquidity", result.market_id);
                     }
                 }
                 Err(e) => {

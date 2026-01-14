@@ -14,7 +14,7 @@ pub const POLYMARKET_WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/
 pub const GAMMA_API_BASE: &str = "https://gamma-api.polymarket.com";
 
 /// Arb threshold: alert when total cost < this (e.g., 0.995 = 0.5% profit)
-pub const ARB_THRESHOLD: f64 = 0.985;
+pub const ARB_THRESHOLD: f64 = 0.96;
 
 /// Polymarket ping interval (seconds) - keep connection alive
 pub const POLY_PING_INTERVAL_SECS: u64 = 30;

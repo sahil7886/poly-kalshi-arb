@@ -654,7 +654,8 @@ pub async fn run_ws(
                         let Some(ticker) = ticker else { continue };
                         let ticker_hash = fxhash_str(ticker);
 
-                        let Some(market_id) = state.kalshi_to_id.read().unwrap().get(&ticker_hash).copied() else { continue };
+                        // Lock-free lookup with DashMap
+                        let Some(market_id) = state.kalshi_to_id.get(&ticker_hash).map(|r| *r) else { continue };
                         let market = &state.markets[market_id as usize];
                         
                         // Get or create local book

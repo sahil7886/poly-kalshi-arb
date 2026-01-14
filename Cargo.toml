@@ -29,6 +29,9 @@ governor = "0.6"
 nonzero_ext = "0.3"
 arrayvec = "0.7"
 wide = "0.7"
+dashmap = "6.1.0"
+axum = { version = "0.7", features = ["ws"] }
+tower-http = { version = "0.5", features = ["cors"] }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

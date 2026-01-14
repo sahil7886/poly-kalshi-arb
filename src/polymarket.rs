@@ -377,11 +377,11 @@ async fn process_book(
         .min_by_key(|(p, _)| *p)
         .unwrap_or((0, 0));
 
-    // Check YES token first
-    let yes_id = state.poly_yes_to_id.read().unwrap().get(&token_hash).copied();
-    // Check NO token (guard dropped before any await)
+    // Check YES token first (lock-free with DashMap)
+    let yes_id = state.poly_yes_to_id.get(&token_hash).map(|r| *r);
+    // Check NO token
     let no_id = if yes_id.is_none() {
-        state.poly_no_to_id.read().unwrap().get(&token_hash).copied()
+        state.poly_no_to_id.get(&token_hash).map(|r| *r)
     } else {
         None
     };
@@ -429,11 +429,11 @@ async fn process_price_change(
 
     let token_hash = fxhash_str(&change.asset_id);
 
-    // Check YES token first (guard dropped immediately)
-    let yes_id = state.poly_yes_to_id.read().unwrap().get(&token_hash).copied();
-    // Check NO token (guard dropped before any await)
+    // Check YES token first (lock-free with DashMap)
+    let yes_id = state.poly_yes_to_id.get(&token_hash).map(|r| *r);
+    // Check NO token
     let no_id = if yes_id.is_none() {
-        state.poly_no_to_id.read().unwrap().get(&token_hash).copied()
+        state.poly_no_to_id.get(&token_hash).map(|r| *r)
     } else {
         None
     };

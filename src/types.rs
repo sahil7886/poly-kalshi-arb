@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, AtomicU16, Ordering};
 use std::sync::{Arc, RwLock};
-use rustc_hash::FxHashMap;
+use dashmap::DashMap;
 
 // === Market Types ===
 
@@ -325,14 +325,14 @@ pub struct GlobalState {
     /// Next available market_id (atomic for thread-safe increment)
     next_market_id: AtomicU16,
 
-    /// O(1) lookup: pre-hashed Kalshi ticker → market_id (RwLock for dynamic updates)
-    pub kalshi_to_id: RwLock<FxHashMap<u64, u16>>,
+    /// O(1) lookup: pre-hashed Kalshi ticker → market_id (DashMap for lock-free reads)
+    pub kalshi_to_id: DashMap<u64, u16>,
 
-    /// O(1) lookup: pre-hashed Poly YES token → market_id (RwLock for dynamic updates)
-    pub poly_yes_to_id: RwLock<FxHashMap<u64, u16>>,
+    /// O(1) lookup: pre-hashed Poly YES token → market_id (DashMap for lock-free reads)
+    pub poly_yes_to_id: DashMap<u64, u16>,
 
-    /// O(1) lookup: pre-hashed Poly NO token → market_id (RwLock for dynamic updates)
-    pub poly_no_to_id: RwLock<FxHashMap<u64, u16>>,
+    /// O(1) lookup: pre-hashed Poly NO token → market_id (DashMap for lock-free reads)
+    pub poly_no_to_id: DashMap<u64, u16>,
 }
 
 impl GlobalState {
@@ -345,9 +345,9 @@ impl GlobalState {
         Self {
             markets,
             next_market_id: AtomicU16::new(0),
-            kalshi_to_id: RwLock::new(FxHashMap::default()),
-            poly_yes_to_id: RwLock::new(FxHashMap::default()),
-            poly_no_to_id: RwLock::new(FxHashMap::default()),
+            kalshi_to_id: DashMap::default(),
+            poly_yes_to_id: DashMap::default(),
+            poly_no_to_id: DashMap::default(),
         }
     }
 
@@ -364,13 +364,16 @@ impl GlobalState {
         let poly_yes_hash = fxhash_str(&pair.poly_yes_token);
         let poly_no_hash = fxhash_str(&pair.poly_no_token);
 
-        // Update lookup maps (write locks)
-        self.kalshi_to_id.write().unwrap().insert(kalshi_hash, market_id);
-        self.poly_yes_to_id.write().unwrap().insert(poly_yes_hash, market_id);
-        self.poly_no_to_id.write().unwrap().insert(poly_no_hash, market_id);
-
-        // Store pair using thread-safe set_pair
+        // CRITICAL: Store pair FIRST, before hash maps
+        // This ensures that by the time WebSocket can find this market via hash lookup,
+        // the pair is already set and execution won't fail
         self.markets[market_id as usize].set_pair(pair);
+
+        // THEN update lookup maps (lock-free with DashMap)
+        // Once these are set, WebSockets can find the market, so pair must be ready
+        self.kalshi_to_id.insert(kalshi_hash, market_id);
+        self.poly_yes_to_id.insert(poly_yes_hash, market_id);
+        self.poly_no_to_id.insert(poly_no_hash, market_id);
 
         Some(market_id)
     }
@@ -379,8 +382,7 @@ impl GlobalState {
     #[inline(always)]
     #[allow(dead_code)]
     pub fn get_by_kalshi_hash(&self, hash: u64) -> Option<&AtomicMarketState> {
-        let guard = self.kalshi_to_id.read().ok()?;
-        let id = *guard.get(&hash)?;
+        let id = *self.kalshi_to_id.get(&hash)?;
         Some(&self.markets[id as usize])
     }
 
@@ -388,8 +390,7 @@ impl GlobalState {
     #[inline(always)]
     #[allow(dead_code)]
     pub fn get_by_poly_yes_hash(&self, hash: u64) -> Option<&AtomicMarketState> {
-        let guard = self.poly_yes_to_id.read().ok()?;
-        let id = *guard.get(&hash)?;
+        let id = *self.poly_yes_to_id.get(&hash)?;
         Some(&self.markets[id as usize])
     }
 
@@ -397,8 +398,7 @@ impl GlobalState {
     #[inline(always)]
     #[allow(dead_code)]
     pub fn get_by_poly_no_hash(&self, hash: u64) -> Option<&AtomicMarketState> {
-        let guard = self.poly_no_to_id.read().ok()?;
-        let id = *guard.get(&hash)?;
+        let id = *self.poly_no_to_id.get(&hash)?;
         Some(&self.markets[id as usize])
     }
 
@@ -406,21 +406,21 @@ impl GlobalState {
     #[inline(always)]
     #[allow(dead_code)]
     pub fn id_by_poly_yes_hash(&self, hash: u64) -> Option<u16> {
-        self.poly_yes_to_id.read().ok()?.get(&hash).copied()
+        self.poly_yes_to_id.get(&hash).map(|r| *r)
     }
 
     /// Get market_id by Poly NO token hash
     #[inline(always)]
     #[allow(dead_code)]
     pub fn id_by_poly_no_hash(&self, hash: u64) -> Option<u16> {
-        self.poly_no_to_id.read().ok()?.get(&hash).copied()
+        self.poly_no_to_id.get(&hash).map(|r| *r)
     }
 
     /// Get market_id by Kalshi ticker hash
     #[inline(always)]
     #[allow(dead_code)]
     pub fn id_by_kalshi_hash(&self, hash: u64) -> Option<u16> {
-        self.kalshi_to_id.read().ok()?.get(&hash).copied()
+        self.kalshi_to_id.get(&hash).map(|r| *r)
     }
 
     /// Get market by ID
@@ -506,13 +506,14 @@ mod tests {
 
     #[test]
     fn test_pack_bit_layout() {
-        // Verify the exact bit layout: [yes_ask:16][no_ask:16][yes_size:16][no_size:16]
-        let packed = pack_orderbook(0xABCD, 0x1234, 0x5678, 0x9ABC);
+        // Verify the exact bit layout: [yes_ask:8][no_ask:8][yes_size:24][no_size:24]
+        // Use values that fit: prices are u8 (0-255), sizes are u32 (24-bit storage)
+        let packed = pack_orderbook(0xAB, 0x12, 0x5678, 0x9ABC);
 
-        assert_eq!((packed >> 48) & 0xFFFF, 0xABCD, "yes_ask should be in bits 48-63");
-        assert_eq!((packed >> 32) & 0xFFFF, 0x1234, "no_ask should be in bits 32-47");
-        assert_eq!((packed >> 16) & 0xFFFF, 0x5678, "yes_size should be in bits 16-31");
-        assert_eq!(packed & 0xFFFF, 0x9ABC, "no_size should be in bits 0-15");
+        assert_eq!((packed >> 56) & 0xFF, 0xAB, "yes_ask should be in bits 56-63");
+        assert_eq!((packed >> 48) & 0xFF, 0x12, "no_ask should be in bits 48-55");
+        assert_eq!((packed >> 24) & 0xFFFFFF, 0x5678, "yes_size should be in bits 24-47");
+        assert_eq!(packed & 0xFFFFFF, 0x9ABC, "no_size should be in bits 0-23");
     }
 
     // =========================================================================
@@ -578,9 +579,9 @@ mod tests {
             thread::spawn(move || {
                 for _ in 0..1000 {
                     if i % 2 == 0 {
-                        book.update_yes(45 + (i as u16), 500);
+                        book.update_yes(45 + (i as u8), 500);
                     } else {
-                        book.update_no(55 + (i as u16), 500);
+                        book.update_no(55 + (i as u8), 500);
                     }
                 }
             })
@@ -638,7 +639,7 @@ mod tests {
         for price_cents in 1..100u16 {
             let p = price_cents as f64 / 100.0;
             let float_fee = (0.07 * p * (1.0 - p) * 100.0).ceil() as u16;
-            let int_fee = kalshi_fee_cents(price_cents);
+            let int_fee = kalshi_fee_cents(price_cents as u8);
 
             // Allow 1 cent difference due to rounding differences
             assert!(
@@ -1166,10 +1167,10 @@ mod tests {
                     let market = &state.markets[0];
                     if i % 2 == 0 {
                         // Simulate Kalshi updates
-                        market.kalshi.update_yes(40 + ((j % 10) as u16), 500 + j as u16);
+                        market.kalshi.update_yes(40 + ((j % 10) as u8), 500 + j as u32);
                     } else {
                         // Simulate Poly updates
-                        market.poly.update_no(50 + ((j % 10) as u16), 600 + j as u16);
+                        market.poly.update_no(50 + ((j % 10) as u8), 600 + j as u32);
                     }
 
                     // Check arbs (should never panic) - threshold = 100 cents

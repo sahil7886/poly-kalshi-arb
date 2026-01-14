@@ -6,6 +6,7 @@
 mod cache;
 mod circuit_breaker;
 mod config;
+mod dashboard;
 mod discovery;
 mod execution;
 mod kalshi;
@@ -46,6 +47,7 @@ async fn run_session(
     dry_run: bool,
     full_duration_secs: u64,
     funder: String,
+    dashboard_state: Arc<dashboard::DashboardState>,
 ) -> Result<()> {
     // Run discovery (always force refresh for new sessions)
     info!("🔍 Discovering markets (forced refresh)...");
@@ -101,6 +103,7 @@ async fn run_session(
         circuit_breaker.clone(),
         position_channel,
         dry_run,
+        Some(dashboard_state.clone()),
     ));
 
     let exec_handle = tokio::spawn(run_execution_loop(exec_rx, engine));
@@ -115,8 +118,9 @@ async fn run_session(
         private_key: kalshi_ws_config.private_key.clone(),
     };
     
-    // Reconnect every 10 minutes to pick up new markets (BTC 15m markets rotate every 15 mins)
-    const WS_REFRESH_INTERVAL_SECS: u64 = 600; // 10 minutes
+    // Reconnect every 5 minutes to pick up new markets (matches discovery interval)
+    // BTC 15m markets rotate every 15 mins, so we need to refresh more frequently
+    const WS_REFRESH_INTERVAL_SECS: u64 = 300; // 5 minutes
     
     let kalshi_ws_handle = tokio::spawn(async move {
         loop {
@@ -127,7 +131,7 @@ async fn run_session(
         }
     });
 
-    // Start Polymarket WebSocket
+    // Start Polymarket WebSocket (same refresh interval as Kalshi)
     let poly_state = state.clone();
     let poly_exec_tx = exec_tx.clone();
     let poly_threshold = threshold_cents;
@@ -164,12 +168,9 @@ async fn run_session(
             
             let mut new_markets = 0;
             for pair in result.pairs {
-                // Check if already tracked (by Kalshi ticker)
+                // Check if already tracked (by Kalshi ticker) - lock-free with DashMap
                 let ticker_hash = crate::types::fxhash_str(&pair.kalshi_market_ticker);
-                let already_tracked = manager_state.kalshi_to_id.read()
-                    .ok()
-                    .map(|guard| guard.contains_key(&ticker_hash))
-                    .unwrap_or(false);
+                let already_tracked = manager_state.kalshi_to_id.contains_key(&ticker_hash);
                 
                 if !already_tracked {
                     if manager_state.add_pair(pair).is_some() {
@@ -419,6 +420,14 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Start Dashboard Server
+    let dashboard_state = dashboard::DashboardState::new();
+    let dashboard_port: u16 = std::env::var("DASHBOARD_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5051);
+    dashboard::start_dashboard_server(dashboard_state.clone(), dashboard_port);
+
     // SUPERVISOR LOOP
     // Run for 4 hours (fetching ~20 markets covers 5 hours, so 4 hours is safe)
     let session_duration = 14400; 
@@ -434,6 +443,7 @@ async fn main() -> Result<()> {
             dry_run,
             session_duration,
             poly_funder.clone(),
+            dashboard_state.clone(),
         ).await {
             Ok(_) => {
                 info!("✅ Session completed normally. Restarting...");
