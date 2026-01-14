@@ -218,7 +218,7 @@ impl ExecutionEngine {
                         success: false,
                         profit_cents: 0,
                         latency_ns: self.clock.now_ns() - req.detected_ns,
-                        error: Some("Poly exposure limit reached"),
+                        error: None, // Silent skip - exposure limit
                     });
                 }
                 let poly_affordable = poly_remaining / poly_exposure_per_contract;
@@ -234,7 +234,7 @@ impl ExecutionEngine {
                         success: false,
                         profit_cents: 0,
                         latency_ns: self.clock.now_ns() - req.detected_ns,
-                        error: Some("Kalshi exposure limit reached"),
+                        error: None, // Silent skip - exposure limit
                     });
                 }
                 let kalshi_affordable = kalshi_remaining / kalshi_exposure_per_contract;
@@ -353,8 +353,44 @@ impl ExecutionEngine {
 
         if self.dry_run {
             info!("[EXEC] 🏃 DRY RUN - would execute {} contracts", max_contracts);
-            
-            
+
+            // Update exposure tracking in test mode (simulate successful trade)
+            if self.test_mode {
+                let (poly_exp, kalshi_exp) = match req.arb_type {
+                    ArbType::PolyYesKalshiNo => {
+                        (req.yes_price as i64 * max_contracts, (100 - req.no_price) as i64 * max_contracts)
+                    }
+                    ArbType::KalshiYesPolyNo => {
+                        ((100 - req.no_price) as i64 * max_contracts, req.yes_price as i64 * max_contracts)
+                    }
+                    ArbType::PolyOnly => {
+                        let yes_exp = req.yes_price as i64;
+                        let no_exp = (100 - req.no_price) as i64;
+                        (yes_exp.max(no_exp) * max_contracts, 0)
+                    }
+                    ArbType::KalshiOnly => {
+                        let yes_exp = req.yes_price as i64;
+                        let no_exp = (100 - req.no_price) as i64;
+                        (0, yes_exp.max(no_exp) * max_contracts)
+                    }
+                };
+
+                if poly_exp > 0 {
+                    let new_poly = self.poly_exposure_cents.fetch_add(poly_exp, Ordering::Relaxed) + poly_exp;
+                    info!("[EXPOSURE] Poly: +${:.2} -> ${:.2}/{:.2}",
+                        poly_exp as f64 / 100.0,
+                        new_poly as f64 / 100.0,
+                        TEST_MODE_MAX_EXPOSURE_CENTS as f64 / 100.0);
+                }
+                if kalshi_exp > 0 {
+                    let new_kalshi = self.kalshi_exposure_cents.fetch_add(kalshi_exp, Ordering::Relaxed) + kalshi_exp;
+                    info!("[EXPOSURE] Kalshi: +${:.2} -> ${:.2}/{:.2}",
+                        kalshi_exp as f64 / 100.0,
+                        new_kalshi as f64 / 100.0,
+                        TEST_MODE_MAX_EXPOSURE_CENTS as f64 / 100.0);
+                }
+            }
+
             // Update last execution time for this market
             self.dry_run_tracker.insert(market_id, Instant::now());
             // Record simulated trade in dashboard
@@ -369,7 +405,7 @@ impl ExecutionEngine {
                     time: chrono::Local::now().format("%H:%M:%S").to_string(),
                 });
             }
-            
+
             self.release_in_flight_delayed(market_id);
             return Ok(ExecutionResult {
                 market_id,
@@ -855,6 +891,23 @@ impl ExecutionEngine {
                 let mask = !(1u64 << bit);
                 in_flight[slot].fetch_and(mask, Ordering::Release);
             });
+        }
+    }
+
+    /// Reset exposure counters (called after redemption to free up capacity)
+    /// This assumes settled positions have been redeemed and exposure is now zero
+    pub fn reset_exposure(&self) {
+        if self.test_mode {
+            let old_poly = self.poly_exposure_cents.swap(0, Ordering::Relaxed);
+            let old_kalshi = self.kalshi_exposure_cents.swap(0, Ordering::Relaxed);
+
+            if old_poly > 0 || old_kalshi > 0 {
+                info!(
+                    "[EXPOSURE] Reset after redemption: Poly ${:.2} -> $0, Kalshi ${:.2} -> $0",
+                    old_poly as f64 / 100.0,
+                    old_kalshi as f64 / 100.0
+                );
+            }
         }
     }
 }

@@ -165,10 +165,15 @@ impl RedemptionManager {
     }
 }
 
-/// Main hourly loop for auto-redemption
-pub async fn run_hourly_loop(poly_client: Arc<SharedAsyncClient>, rpc_url: String, funder: String) {
-    info!("[REDEEM] Auto-redemption started (checks every 1 hour)");
-    
+/// Main loop for auto-redemption (runs every 15 minutes)
+pub async fn run_hourly_loop(
+    poly_client: Arc<SharedAsyncClient>,
+    rpc_url: String,
+    funder: String,
+    engine: Option<Arc<crate::execution::ExecutionEngine>>,
+) {
+    info!("[REDEEM] Auto-redemption started (checks every 15 minutes)");
+
     let manager = match RedemptionManager::new(poly_client, rpc_url, funder) {
         Ok(m) => m,
         Err(e) => {
@@ -177,16 +182,21 @@ pub async fn run_hourly_loop(poly_client: Arc<SharedAsyncClient>, rpc_url: Strin
         }
     };
 
-    // Wait 1 hour before first check (assume everything redeemed at startup)
-    info!("[REDEEM] First check in 1 hour...");
-    tokio::time::sleep(Duration::from_secs(3600)).await;
+    // Wait 15 minutes before first check (assume everything redeemed at startup)
+    info!("[REDEEM] First check in 15 minutes...");
+    tokio::time::sleep(Duration::from_secs(900)).await;
 
     loop {
         if let Err(e) = manager.redeem_all().await {
             error!("[REDEEM] Loop error: {}", e);
         }
-        
-        info!("[REDEEM] Next check in 1 hour...");
-        tokio::time::sleep(Duration::from_secs(3600)).await;
+
+        // Reset exposure counters after redemption (positions are now settled)
+        if let Some(ref eng) = engine {
+            eng.reset_exposure();
+        }
+
+        info!("[REDEEM] Next check in 15 minutes...");
+        tokio::time::sleep(Duration::from_secs(900)).await;
     }
 }

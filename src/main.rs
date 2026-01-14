@@ -106,7 +106,7 @@ async fn run_session(
         Some(dashboard_state.clone()),
     ));
 
-    let exec_handle = tokio::spawn(run_execution_loop(exec_rx, engine));
+    let exec_handle = tokio::spawn(run_execution_loop(exec_rx, engine.clone()));
 
     // Start Kalshi WebSocket
     let kalshi_state = state.clone();
@@ -144,10 +144,15 @@ async fn run_session(
         }
     });
 
-    // Start redemption background task (hourly)
+    // Start redemption background task (runs every 15 minutes)
     let redemption_handle = if !dry_run {
         let rpc_url = std::env::var("POLYGON_RPC_URL").unwrap_or_else(|_| "https://polygon-rpc.com".to_string());
-        Some(tokio::spawn(crate::redemption::run_hourly_loop(poly_async.clone(), rpc_url, funder)))
+        Some(tokio::spawn(crate::redemption::run_hourly_loop(
+            poly_async.clone(),
+            rpc_url,
+            funder,
+            Some(engine.clone()),
+        )))
     } else {
         None
     };
